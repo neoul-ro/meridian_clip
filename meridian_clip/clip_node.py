@@ -4,7 +4,9 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 
-from meridian_msgs.msg import RGBDFrame, SegmentImage, InstanceEmbeddingSet
+from sensor_msgs.msg import Image
+
+from meridian_msgs.msg import InstanceEmbeddingSet
 
 # buffer keys are bounded to this many entries, dropping the oldest on overflow
 BUFFER_LIMIT = 200
@@ -21,7 +23,7 @@ class MeridianClip(Node):
         self.embedding_model_id = self.get_parameter('embedding_model_id').value
 
         self.bridge = CvBridge()
-        self.rgbd_buffer = {}
+        self.rgb_buffer = {}
         self.segment_buffer = {}
 
         qos = QoSProfile(
@@ -29,10 +31,10 @@ class MeridianClip(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=10)
 
-        self.rgbd_sub = self.create_subscription(
-            RGBDFrame, '/rgbd_frame', self.rgbd_callback, qos)
+        self.rgb_sub = self.create_subscription(
+            Image, '/camera/rgb', self.rgb_callback, qos)
         self.segment_sub = self.create_subscription(
-            SegmentImage, '/segment_image', self.segment_callback, qos)
+            Image, '/segment_image', self.segment_callback, qos)
         self.embedding_pub = self.create_publisher(
             InstanceEmbeddingSet, '/instance_embedding_set', qos)
 
@@ -40,16 +42,16 @@ class MeridianClip(Node):
             'meridian_clip started: embedding_dim=%d embedding_model_id=%s' %
             (self.embedding_dim, self.embedding_model_id))
 
-    def rgbd_callback(self, msg):
-        key = (msg.timestamp.sec, msg.timestamp.nanosec)
-        self._buffer_put(self.rgbd_buffer, key, msg)
+    def rgb_callback(self, msg):
+        key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        self._buffer_put(self.rgb_buffer, key, msg)
         if key in self.segment_buffer:
             self.process(key)
 
     def segment_callback(self, msg):
-        key = (msg.timestamp.sec, msg.timestamp.nanosec)
+        key = (msg.header.stamp.sec, msg.header.stamp.nanosec)
         self._buffer_put(self.segment_buffer, key, msg)
-        if key in self.rgbd_buffer:
+        if key in self.rgb_buffer:
             self.process(key)
 
     def _buffer_put(self, buffer, key, msg):
@@ -59,11 +61,11 @@ class MeridianClip(Node):
             del buffer[oldest_key]
 
     def process(self, key):
-        rgbd_msg = self.rgbd_buffer.pop(key)
+        rgb_msg = self.rgb_buffer.pop(key)
         segment_msg = self.segment_buffer.pop(key)
 
-        rgb = self.bridge.imgmsg_to_cv2(rgbd_msg.rgb, desired_encoding='rgb8')
-        labels = self.bridge.imgmsg_to_cv2(segment_msg.labels, desired_encoding='mono8')
+        rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='rgb8')
+        labels = self.bridge.imgmsg_to_cv2(segment_msg, desired_encoding='mono8')
 
         unique_ids = np.unique(labels)
         unique_ids = unique_ids[unique_ids > 0]
@@ -87,7 +89,7 @@ class MeridianClip(Node):
             matrix = np.zeros((0, self.embedding_dim), dtype=np.float32)
 
         out = InstanceEmbeddingSet()
-        out.timestamp = rgbd_msg.timestamp
+        out.timestamp = rgb_msg.header.stamp
         out.embedding_model_id = self.embedding_model_id
         out.embedding_dim = self.embedding_dim
         out.segment_ids = segment_ids
@@ -95,8 +97,8 @@ class MeridianClip(Node):
         self.embedding_pub.publish(out)
 
         self.get_logger().info(
-            'published instance_embedding_set: %d segments (rgbd_buffer=%d segment_buffer=%d)' %
-            (len(segment_ids), len(self.rgbd_buffer), len(self.segment_buffer)),
+            'published instance_embedding_set: %d segments (rgb_buffer=%d segment_buffer=%d)' %
+            (len(segment_ids), len(self.rgb_buffer), len(self.segment_buffer)),
             throttle_duration_sec=5.0)
 
 
