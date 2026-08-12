@@ -1,3 +1,25 @@
-/build/
-/install/
-/log/
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Model weights / ONNX / TensorRT engines
+models/*
+!models/align_patch_to_cls.npy
+!models/align_value_to_cls.npy
+
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# ROS build artifacts
+build/
+install/
+log/
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+.DS_Store
