@@ -31,6 +31,8 @@
   <!-- Runtime dependencies -->
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+  <!-- build_regions 가 ndimage.find_objects 로 모든 라벨의 bbox 를 한 번에 얻는다 -->
+  <exec_depend>python3-scipy</exec_depend>
 
   <!-- Test dependencies -->
   <test_depend>ament_copyright</test_depend>

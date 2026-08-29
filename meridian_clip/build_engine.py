@@ -90,6 +90,8 @@ def build(
     use_fp16: bool,
     workspace_gigabytes: int,
     inputs: Tuple[Tuple[str, Tuple[int, ...]], ...],
+    avg_timing: int = 8,
+    optimization_level: int = 3,
 ) -> None:
     """ONNX를 읽어 직렬화된 TensorRT 엔진을 만든다.
 
@@ -121,9 +123,17 @@ def build(
         workspace_gigabytes << 30,
     )
 
+    # trtexec 의 --avgTiming / --builderOptimizationLevel 과 같다.
+    # 전자는 tactic 하나를 몇 번 재서 평균낼지, 후자는 얼마나 많은 tactic 을
+    # 탐색할지다. 둘 다 올리면 빌드는 느려지지만 결과 엔진이 더 좋아진다.
+    config.avg_timing_iterations = avg_timing
+    config.builder_optimization_level = optimization_level
+
     if use_fp16:
         if not builder.platform_has_fast_fp16:
             print("[warn] 이 GPU는 빠른 fp16을 지원하지 않습니다.")
+        # 커널 내부만 fp16 으로 돈다. 네트워크 입출력은 ONNX 그대로 fp32 다
+        # (DIRECT_IO / fp16 IO format 을 켜지 않는다).
         config.set_flag(trt.BuilderFlag.FP16)
 
     profile = builder.create_optimization_profile()
@@ -480,6 +490,26 @@ def main() -> int:
     )
     parser.add_argument("--workspace", type=int, default=8, help="GiB")
     parser.add_argument(
+        "--avg-timing",
+        type=int,
+        default=8,
+        help=(
+            "tactic 하나를 몇 번 재서 평균낼지 "
+            "(trtexec --avgTiming). 올리면 빌드가 느려지는 대신 "
+            "tactic 선택이 노이즈에 덜 흔들린다."
+        ),
+    )
+    parser.add_argument(
+        "--optimization-level",
+        type=int,
+        default=3,
+        choices=(0, 1, 2, 3, 4, 5),
+        help=(
+            "tactic 탐색 범위 (trtexec --builderOptimizationLevel). "
+            "5가 가장 넓고 가장 느리다."
+        ),
+    )
+    parser.add_argument(
         "--skip-benchmark",
         action="store_true",
     )
@@ -563,6 +593,8 @@ def main() -> int:
             use_fp16=use_fp16,
             workspace_gigabytes=arguments.workspace,
             inputs=inputs,
+            avg_timing=arguments.avg_timing,
+            optimization_level=arguments.optimization_level,
         )
     except Exception as error:
         print(f"[fail] {error}", file=sys.stderr)

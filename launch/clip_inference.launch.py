@@ -65,7 +65,14 @@ LAUNCH_ARGUMENTS = {
     # crop 을 224x224 로 만드는 방법. pad = 긴 변을 224 에 맞추고 채움(기본).
     # centercrop 은 CLIP 원본이지만 길쭉한 물체의 양끝을 잘라낸다.
     "crop_fit": "pad",
-    "batch_size": "16",
+    # 엔진 프로파일의 opt 와 같아야 한다 (models/ 는 min=1/opt=32/max=64).
+    # 어긋나면 TensorRT 가 튜닝하지 않은 배치 크기로 돌게 된다.
+    "batch_size": "32",
+    # 224 기하를 만드는 스레드 수. Jetson Orin(12코어)에서 8개가 최적이었다.
+    "preprocess_workers": "8",
+    # 전처리를 청크 단위로 엔진과 겹칠지. 워커가 CPU 를 채우고 나면 손해라
+    # 기본은 false 다. GPU 가 훨씬 빠른 장비에서만 켜 볼 만하다.
+    "async_preprocess": "false",
     # 49개 patch token 을 합치는 방법.
     #   cls                 : CLS token (CLIP 원본 경로)
     #   mask_weighted_patch : 패치별 객체 점유율로 가중평균. 텍스트 정렬이
@@ -101,6 +108,10 @@ LAUNCH_ARGUMENTS = {
 # 디버그 이미지 저장은 필요할 때 ros2 run 으로 직접 준다:
 #   ros2 run meridian_clip clip_inference_node --backend torch \
 #       --pooling-mode mask_weighted_patch --debug-save-dir /tmp/clip_debug
+#
+# --model-dir 도 같은 이유로 여기 없다. models/ 를 다른 곳에 복사해 두고
+# 위 다섯 경로를 한 번에 그쪽으로 돌릴 때 쓴다:
+#   ros2 run meridian_clip clip_inference_node --model-dir ~/clip_bench_code/models
 
 
 def generate_launch_description() -> LaunchDescription:

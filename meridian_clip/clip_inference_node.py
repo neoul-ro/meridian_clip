@@ -34,12 +34,18 @@ main()에서 생성자 인자로 넘긴다. (fastsam_node.py 와 동일한 방�
 from __future__ import annotations
 
 import argparse
+import queue
 import sys
+import threading
+import time
 
+from array import array
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import rclpy
 
@@ -47,6 +53,7 @@ from builtin_interfaces.msg import Time
 from cv_bridge import CvBridge
 from meridian_msgs.msg import InstanceEmbeddingSet
 from PIL import Image as PILImage
+from scipy import ndimage
 from sensor_msgs.msg import Image as RosImage
 from rclpy.node import Node
 from rclpy.qos import (
@@ -67,13 +74,33 @@ from vision_msgs.msg import (
 from meridian_clip.clip_backend import (
     CROP_FITS,
     DEFAULT_CROP_FIT,
+    DEFAULT_ASYNC_PREPROCESS,
+    DEFAULT_PREPROCESS_PATH,
+    PREPROCESS_PATHS,
+    PREPROCESS_WORKERS,
     EMPTY_MASK_FALLBACKS,
     POOLING_MODES,
     build_debug_geometry,
     create_backend,
     create_text_encoder,
     l2_normalize,
+    limit_blas_threads,
+    prepare_from_frame,
 )
+
+
+# CPU 전처리(1단계)와 GPU 추론(2단계)을 다른 스레드에서 겹쳐 돌린다.
+# 처리량은 오르지만 프레임 하나의 지연은 줄지 않는다 (오히려 큐 대기만큼
+# 늘어난다). 지연이 중요한 소비자가 있으면 꺼 둔다.
+DEFAULT_PIPELINE_ENABLED = False
+
+# 준비된 프레임을 담아 두는 큐 깊이. 가득 차면 가장 오래된 것을 버리고
+# 최신 프레임을 넣는다 (최신 우선). 깊이를 키워도 처리량은 안 오르고
+# 지연만 늘어난다.
+DEFAULT_PIPELINE_QUEUE_DEPTH = 2
+
+# N 프레임마다 단계별 소요시간을 한 줄로 찍는다. 0 이면 끈다.
+DEFAULT_STATS_EVERY = 0
 
 
 # label map에서 0은 background/invalid 이므로 embedding 대상이 아니다.
@@ -124,6 +151,21 @@ DEFAULT_PROMPTS = (
     "a window",
 )
 
+# zero-shot semantics(Detection2DArray)를 함께 발행할지.
+#
+# 기본값이 끔인 이유는 비용이다. 세그먼트 32개 기준 프레임당 5.1ms 로
+# Postprocessing 의 88% 를 차지하는데, 그중 유사도 행렬곱은 0.07ms 뿐이고
+# 나머지는 Detection2D 32개를 파이썬 객체로 만드는 값이다. 끄면 텍스트
+# 인코더(126MB 엔진)도 로드하지 않는다.
+#
+# 실측 (N=32, mask_weighted_value):
+#   순차     22.9 -> 26.0 FPS
+#   파이프라인 36.1 -> 45.1 FPS
+#
+# 소비자가 있으면 켠다:
+#   ros2 launch ... publish_semantics:=true
+DEFAULT_PUBLISH_SEMANTICS = False
+
 # 세그먼트마다 발행할 상위 후보 수
 DEFAULT_TOP_K = 3
 
@@ -150,6 +192,15 @@ BACKENDS = (
 # 기본은 tensorrt. 엔진이 없거나 다른 GPU/TensorRT 버전이면 시작할 때 바로 실패하며,
 # 그때는 --backend torch 로 돌리거나 build_engine.py 로 엔진을 다시 빌드한다.
 DEFAULT_BACKEND = "tensorrt"
+
+# 플랫폼마다 모델 파일의 디렉터리만 다르게 줄 수 있다. 빈 문자열이면 아래
+# 개별 경로 기본값을 그대로 쓴다. --model-dir 를 주면 engine/checkpoint와
+# 자동 선택되는 text alignment matrix의 디렉터리를 이 값으로 통일한다.
+DEFAULT_MODEL_DIR = ""
+
+# 하드웨어에 따라 달라지는 성능 파라미터. 알고리즘에는 영향을 주지 않는다.
+DEFAULT_PREPROCESS_WORKERS = PREPROCESS_WORKERS
+DEFAULT_ASYNC_PREPROCESS_ENABLED = DEFAULT_ASYNC_PREPROCESS
 
 DEFAULT_ENGINE_PATH = (
     "~/meridian/src/meridian_clip/models/"
@@ -404,8 +455,17 @@ DEFAULT_BBOX_PADDING = 4
 # 이보다 작은 segment는 embedding을 만들지 않는다.
 DEFAULT_MIN_SEGMENT_PIXELS = 16
 
-# 한 번에 encode_image에 넣을 segment 수
-DEFAULT_BATCH_SIZE = 16
+# 한 번에 encode_image에 넣을 segment 수.
+#
+# **엔진 프로파일의 opt 와 같아야 한다.** TensorRT 는 opt 배치에 맞춰 커널을
+# 고르므로, 노드가 다른 크기를 넣으면 튜닝되지 않은 지점에서 돌게 된다.
+# models/ 의 엔진은 min=1 / opt=32 / max=64 로 빌드되어 있다:
+#   python3 meridian_clip/build_engine.py --part visual_pooled_value \
+#       --min-batch 1 --opt-batch 32 --max-batch 64
+#
+# 엔진의 max 를 넘기면 노드가 경고와 함께 잘라낸다. 성능을 잴 때는 이 값과
+# 엔진 opt 가 일치하는지부터 확인한다 (README §6).
+DEFAULT_BATCH_SIZE = 32
 
 # cosine similarity를 쓰는 downstream을 위한 L2 정규화
 DEFAULT_NORMALIZE_EMBEDDINGS = True
@@ -443,6 +503,21 @@ def build_qos(reliable: bool, depth: int = DEFAULT_QOS_DEPTH) -> QoSProfile:
     )
 
 
+def parse_bool(value: str) -> bool:
+    """launch 가 넘기는 "true"/"false" 문자열을 bool 로 바꾼다."""
+    lowered = str(value).strip().lower()
+
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+
+    if lowered in ("0", "false", "no", "off"):
+        return False
+
+    raise argparse.ArgumentTypeError(
+        f"expected true/false, got '{value}'"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Meridian CLIP inference ROS2 노드",
@@ -466,10 +541,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="세그먼트별 zero-shot 결과(vision_msgs/Detection2DArray)",
     )
 
+    # 값을 받는 형태로 둔다. launch 가 인자를 항상 "--이름 값" 쌍으로
+    # 넘기므로 BooleanOptionalAction 은 launch 에서 쓸 수 없다.
+    # semantics 발행은 프레임당 5.1ms 라 끄고 쓰는 배포가 흔하다
+    # (세그먼트 32개 기준 Postprocessing 의 88%).
     parser.add_argument(
         "--publish-semantics",
-        action=argparse.BooleanOptionalAction,
-        default=True,
+        type=parse_bool,
+        default=DEFAULT_PUBLISH_SEMANTICS,
+        metavar="true|false",
         help="텍스트 인코더를 로드해 semantics 를 함께 발행할지",
     )
     parser.add_argument(
@@ -520,6 +600,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=BACKENDS,
         default=DEFAULT_BACKEND,
         help="이미지 인코더 구현 (torch=.pt, tensorrt=.engine)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=DEFAULT_MODEL_DIR,
+        help=(
+            "모델/엔진 디렉터리. 비우면 기존 개별 경로를 사용한다. "
+            "지정하면 engine/model/text engine과 자동 alignment 파일의 "
+            "디렉터리를 이 값으로 통일한다"
+        ),
     )
     parser.add_argument(
         "--engine-path",
@@ -584,7 +673,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "49개 patch token 을 합치는 방법. "
             "mask_weighted_value=마지막 블록의 value 투영을 마스크 점유율로 "
-            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%), "
+            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%%), "
             "mask_weighted_patch=최종 patch token 으로 같은 가중평균 "
             "(텍스트 정렬이 깨져 AUC 0.4633, --alignment-matrix 없이는 "
             "zero-shot 라벨링이 동작하지 않는다), "
@@ -667,6 +756,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--preprocess-path",
+        choices=PREPROCESS_PATHS,
+        default=DEFAULT_PREPROCESS_PATH,
+        help=(
+            "224 를 어디서 만들지. "
+            "pil=CPU PIL BICUBIC (기본값, 배포 경로), "
+            "interp_aa=GPU bicubic+antialias (드리프트 최소), "
+            "roi_align=GPU bilinear 배치 1회 (N 이 커도 pre 가 안 늘어남). "
+            "GPU 경로는 --crop-policy bbox --crop-fit pad 전용이며, "
+            "임베딩이 미세하게 달라지므로(코사인 0.998 대) 바꾸면 저장된 "
+            "임베딩을 재생성해야 한다"
+        ),
+    )
+    parser.add_argument(
         "--mask-fill",
         type=int,
         default=DEFAULT_MASK_FILL,
@@ -686,6 +789,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=DEFAULT_BATCH_SIZE,
+    )
+    parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=DEFAULT_PREPROCESS_WORKERS,
+        help="PIL crop/resize ThreadPool worker 수 (플랫폼별 튜닝 값)",
+    )
+    parser.add_argument(
+        "--async-preprocess",
+        type=parse_bool,
+        default=DEFAULT_ASYNC_PREPROCESS_ENABLED,
+        metavar="true|false",
+        help=(
+            "TensorRT에서 PIL 전처리를 future로 제출해 엔진과 겹칠지 여부. "
+            "false면 기존 동기 실행 순서를 사용한다"
+        ),
     )
 
     parser.add_argument(
@@ -721,8 +840,69 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RELIABLE_OUTPUT,
         help="embedding/semantics 발행을 RELIABLE 로 (기본: RELIABLE, 계약 준수)",
     )
+    # BooleanOptionalAction 이 아니라 값을 받는 형태로 둔다. launch 가 인자를
+    # 항상 "--이름 값" 쌍으로 넘기므로 플래그형은 launch 에서 못 쓴다.
+    parser.add_argument(
+        "--pipeline-enabled",
+        type=parse_bool,
+        default=DEFAULT_PIPELINE_ENABLED,
+        metavar="true|false",
+        help="CPU 전처리와 GPU 추론을 겹쳐 돌린다 (처리량↑, 지연은 그대로)",
+    )
+    parser.add_argument(
+        "--pipeline-queue-depth",
+        type=int,
+        default=DEFAULT_PIPELINE_QUEUE_DEPTH,
+        help="준비된 프레임 큐 깊이. 가득 차면 가장 오래된 것을 버린다",
+    )
+    parser.add_argument(
+        "--stats-every",
+        type=int,
+        default=DEFAULT_STATS_EVERY,
+        help="N 프레임마다 단계별 소요시간 한 줄 출력 (0=끔)",
+    )
 
     return parser
+
+
+@dataclass
+class FrameWork:
+    """1단계(preprocess_frame)가 만들고 2단계(infer_frame)가 소비하는 한 프레임.
+
+    프레임에 딸린 것을 전부 들고 다니므로 두 단계가 다른 스레드에서 돌아도
+    timestamp / segment_ids / boxes / 임베딩 행 순서가 섞일 수 없다. 큐는
+    단일 생산자 - 단일 소비자 FIFO 라 순서도 보존된다.
+    """
+
+    stamp: Any
+    header: Any
+    segment_ids: List[int]
+    regions: List[PILImage.Image]
+    masks: List[Optional[np.ndarray]]
+    boxes: List[Tuple[int, int, int, int]]
+    # clip_backend.PreparedBatch. segment 가 없으면 None.
+    prepared: Any
+    # 두 입력의 짝이 맞춰진 시각 (perf_counter). latency 의 기준점이다.
+    arrived_at: float
+    preprocess_ms: float
+    queued_at: float = 0.0
+
+
+@dataclass
+class StageTotals:
+    """단계별 누적. 창(window) 단위로 평균을 내고 비운다."""
+
+    frames: int = 0
+    segments: int = 0
+    preprocess_ms: float = 0.0
+    queue_wait_ms: float = 0.0
+    encoder_ms: float = 0.0
+    postprocess_ms: float = 0.0
+    latency_ms: float = 0.0
+    latency_max_ms: float = 0.0
+    dropped: int = 0
+    started_at: float = field(default_factory=time.perf_counter)
+    finished_at: float = 0.0
 
 
 class ClipInferenceNode(Node):
@@ -734,7 +914,7 @@ class ClipInferenceNode(Node):
         segment_topic: str = DEFAULT_SEGMENT_TOPIC,
         embedding_topic: str = DEFAULT_EMBEDDING_TOPIC,
         semantics_topic: str = DEFAULT_SEMANTICS_TOPIC,
-        publish_semantics: bool = True,
+        publish_semantics: bool = DEFAULT_PUBLISH_SEMANTICS,
         prompts: Optional[List[str]] = None,
         top_k: int = DEFAULT_TOP_K,
         min_score: float = DEFAULT_MIN_SCORE,
@@ -742,6 +922,7 @@ class ClipInferenceNode(Node):
         log_values: int = DEFAULT_LOG_VALUES,
         log_max_segments: int = DEFAULT_LOG_MAX_SEGMENTS,
         backend: str = DEFAULT_BACKEND,
+        model_dir: str = DEFAULT_MODEL_DIR,
         engine_path: str = DEFAULT_ENGINE_PATH,
         pooled_engine_path: str = DEFAULT_POOLED_ENGINE_PATH,
         value_engine_path: str = DEFAULT_VALUE_ENGINE_PATH,
@@ -760,18 +941,28 @@ class ClipInferenceNode(Node):
         debug_save_every: int = DEFAULT_DEBUG_SAVE_EVERY,
         use_cuda: bool = DEFAULT_USE_CUDA,
         crop_policy: str = DEFAULT_CROP_POLICY,
+        preprocess_path: str = DEFAULT_PREPROCESS_PATH,
         mask_fill: int = DEFAULT_MASK_FILL,
         bbox_padding: int = DEFAULT_BBOX_PADDING,
         min_segment_pixels: int = DEFAULT_MIN_SEGMENT_PIXELS,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        preprocess_workers: int = DEFAULT_PREPROCESS_WORKERS,
+        async_preprocess: bool = DEFAULT_ASYNC_PREPROCESS_ENABLED,
         normalize_embeddings: bool = DEFAULT_NORMALIZE_EMBEDDINGS,
         sync_buffer_size: int = DEFAULT_SYNC_BUFFER_SIZE,
         publish_empty_sets: bool = DEFAULT_PUBLISH_EMPTY_SETS,
         qos_depth: int = DEFAULT_QOS_DEPTH,
         reliable_input: bool = DEFAULT_RELIABLE_INPUT,
         reliable_output: bool = DEFAULT_RELIABLE_OUTPUT,
+        pipeline_enabled: bool = DEFAULT_PIPELINE_ENABLED,
+        pipeline_queue_depth: int = DEFAULT_PIPELINE_QUEUE_DEPTH,
+        stats_every: int = DEFAULT_STATS_EVERY,
     ) -> None:
         super().__init__("clip_inference_node")
+
+        # BLAS 워커가 프레임마다 깨어나는 비용이 numpy 연산 본체보다 크다.
+        # limit_blas_threads() 주석 참고. 백엔드보다 먼저 불러 둔다.
+        limit_blas_threads(1)
 
         # ============================================================
         # Configuration
@@ -797,9 +988,17 @@ class ClipInferenceNode(Node):
         self.last_skipped_count = 0
 
         self.backend_name = backend
-        self.engine_path = engine_path
-        self.pooled_engine_path = pooled_engine_path
-        self.value_engine_path = value_engine_path
+        self.model_dir = str(Path(model_dir).expanduser()) if model_dir else ""
+
+        def model_asset(path: str) -> str:
+            if not path or not self.model_dir:
+                return path
+            return str(Path(self.model_dir) / Path(path).expanduser().name)
+
+        # --model-dir를 주면 플랫폼별 workspace 차이를 여기서만 흡수한다.
+        self.engine_path = model_asset(engine_path)
+        self.pooled_engine_path = model_asset(pooled_engine_path)
+        self.value_engine_path = model_asset(value_engine_path)
 
         if crop_fit not in CROP_FITS:
             raise ValueError(
@@ -809,9 +1008,9 @@ class ClipInferenceNode(Node):
         self.crop_fit = crop_fit
 
         self.text_backend_name = text_backend
-        self.text_engine_path = text_engine_path
+        self.text_engine_path = model_asset(text_engine_path)
 
-        self.model_path = model_path
+        self.model_path = model_asset(model_path)
         self.use_cuda = use_cuda
 
         self.pooling_mode = pooling_mode
@@ -835,9 +1034,16 @@ class ClipInferenceNode(Node):
         # 텍스트 쪽은 이미지 임베딩을 건드리지 않으므로 ID 가 바뀌지 않는다.
         # 저장된 임베딩은 여전히 순수 pooling 공간이고, 달라지는 것은
         # /clip_semantics 의 라벨뿐이다.
-        self.text_alignment_matrix = self.load_text_alignment_matrix(
-            text_alignment_matrix
+        # semantics 를 끄면 텍스트 인코더가 없어 곱할 대상 자체가 없다.
+        # 그래도 읽으면 startup 로그가 "쓰고 있다"고 거짓말을 한다.
+        self.text_alignment_matrix = (
+            self.load_text_alignment_matrix(text_alignment_matrix)
+            if self.publish_semantics
+            else None
         )
+
+        if not self.publish_semantics:
+            self.text_alignment_matrix_path = ""
 
         if (
             self.alignment_matrix is not None
@@ -858,10 +1064,50 @@ class ClipInferenceNode(Node):
 
         self.crop_policy = crop_policy
         self.mask_fill = int(mask_fill)
+
+        # 224 를 어디서 만들지. 기본은 pil (기존 배포 경로) 이고, GPU 경로는
+        # crop 복사 / PIL 생성 / 장별 H2D 를 건너뛴다. 선택 기준과 실측치는
+        # clip_backend.PREPROCESS_PATHS 주석에 있다.
+        #
+        # **경로를 바꾸면 임베딩이 미세하게 달라진다** (코사인 0.998 대). 이미
+        # 저장한 임베딩과 섞어 거리 비교를 하면 같은 물체가 0.95 대로 벌어지므로
+        # (인스턴스 매칭 / 재식별이 정확히 그것을 한다), 전환하면 저장된
+        # 임베딩을 전부 재생성해야 한다. 그래서 기본값은 건드리지 않는다.
+        if preprocess_path not in PREPROCESS_PATHS:
+            raise ValueError(
+                f"preprocess_path must be one of {PREPROCESS_PATHS}, "
+                f"got '{preprocess_path}'"
+            )
+
+        self.preprocess_path = preprocess_path
+
+        # GPU 경로는 bbox crop + pad 기하 위에서만 성립한다. masked_bbox /
+        # masked_full 은 crop 안을 mask_fill 로 칠하는데 그건 CPU 마스크가
+        # 있어야 하고, centercrop / stretch 는 기하 자체가 다르다.
+        if self.preprocess_path != "pil":
+            if self.crop_policy != "bbox":
+                raise ValueError(
+                    f"preprocess_path='{self.preprocess_path}' requires "
+                    f"crop_policy='bbox', got '{self.crop_policy}'"
+                )
+
+            if crop_fit != DEFAULT_CROP_FIT:
+                raise ValueError(
+                    f"preprocess_path='{self.preprocess_path}' requires "
+                    f"crop_fit='{DEFAULT_CROP_FIT}', got '{crop_fit}'"
+                )
+
+        # cls 경로는 마스크를 쓰지 않는다. 백엔드가 무시하고, 디버그 저장은
+        # stats(=None) 에서 먼저 빠져나간다. 그런데도 세그먼트마다 PIL 이미지를
+        # 만들고 있었다 (N=32 에서 0.93ms). crop 안의 bool 배열은 masked_bbox /
+        # masked_full 이 fill 에 쓰므로 그대로 두고, PIL 변환만 건너뛴다.
+        self.needs_region_masks = pooling_mode != "cls"
         self.bbox_padding = int(bbox_padding)
 
         self.min_segment_pixels = int(min_segment_pixels)
         self.batch_size = int(batch_size)
+        self.preprocess_workers = int(preprocess_workers)
+        self.async_preprocess = bool(async_preprocess)
         self.normalize_embeddings = normalize_embeddings
 
         self.sync_buffer_size = int(sync_buffer_size)
@@ -881,6 +1127,11 @@ class ClipInferenceNode(Node):
         if self.batch_size < 1:
             raise ValueError(
                 "batch_size must be at least 1"
+            )
+
+        if self.preprocess_workers < 1:
+            raise ValueError(
+                "preprocess_workers must be at least 1"
             )
 
         if self.backend_name not in BACKENDS:
@@ -979,6 +1230,8 @@ class ClipInferenceNode(Node):
             engine_path=self.active_engine_path,
             use_cuda=self.use_cuda,
             crop_fit=self.crop_fit,
+            preprocess_workers=self.preprocess_workers,
+            async_preprocess=self.async_preprocess,
         )
 
         self.device = self.backend.device
@@ -999,6 +1252,13 @@ class ClipInferenceNode(Node):
 
         self.get_logger().info(self.backend.description)
         self.get_logger().info(f"Device: {self.device}")
+        self.get_logger().info(
+            "Platform tuning: "
+            f"model_dir={self.model_dir or '(individual paths)'}, "
+            f"preprocess_workers={self.preprocess_workers}, "
+            f"async_preprocess={self.async_preprocess}, "
+            f"batch_size={self.batch_size}"
+        )
 
         # 엔진은 optimization profile 의 max batch 를 넘길 수 없다.
         if self.backend.max_batch and self.batch_size > self.backend.max_batch:
@@ -1111,6 +1371,46 @@ class ClipInferenceNode(Node):
 
         self.bridge = CvBridge()
 
+        # ============================================================
+        # 2-stage pipeline
+        # ============================================================
+        #
+        # 1단계는 CPU (PIL 기하 + numpy), 2단계는 GPU (TensorRT) 라 서로
+        # 겹칠 수 있다. 1단계는 구독 콜백 스레드가, 2단계는 아래 워커가
+        # 맡는다. 두 단계가 부르는 함수는 순차 모드와 **완전히 같다**
+        # (process_frame 이 둘을 이어 붙인 것뿐이다).
+        self.pipeline_enabled = bool(pipeline_enabled)
+        self.pipeline_queue_depth = max(1, int(pipeline_queue_depth))
+        self.stats_every = int(stats_every)
+
+        self.pipeline_queue: Optional[queue.Queue] = None
+        self.pipeline_thread: Optional[threading.Thread] = None
+
+        self.stats_lock = threading.Lock()
+        self.stage_totals = StageTotals()
+
+        if self.pipeline_enabled:
+            self.pipeline_queue = queue.Queue(
+                maxsize=self.pipeline_queue_depth
+            )
+
+            self.pipeline_thread = threading.Thread(
+                target=self.pipeline_worker,
+                name="clip-inference",
+                daemon=True,
+            )
+            self.pipeline_thread.start()
+
+        self.get_logger().info(
+            "Pipeline: "
+            + (
+                f"enabled (queue depth {self.pipeline_queue_depth}, "
+                "drop-oldest)"
+                if self.pipeline_enabled
+                else "disabled (sequential)"
+            )
+        )
+
         sub_qos = build_qos(reliable_input, qos_depth)
         pub_qos = build_qos(reliable_output, qos_depth)
 
@@ -1180,7 +1480,8 @@ class ClipInferenceNode(Node):
         )
 
         self.get_logger().info(
-            f"Crop policy: {self.crop_policy} (fit={self.crop_fit})"
+            f"Crop policy: {self.crop_policy} (fit={self.crop_fit}, "
+            f"preprocess={self.preprocess_path})"
         )
 
         self.get_logger().info(
@@ -1308,10 +1609,16 @@ class ClipInferenceNode(Node):
         segment_msg = self.segment_buffer.pop(key)
 
         try:
-            self.process_frame(
-                color_msg=color_msg,
-                segment_msg=segment_msg,
-            )
+            if self.pipeline_enabled:
+                self.submit_frame(
+                    color_msg=color_msg,
+                    segment_msg=segment_msg,
+                )
+            else:
+                self.process_frame(
+                    color_msg=color_msg,
+                    segment_msg=segment_msg,
+                )
 
         except Exception as error:
             self.get_logger().error(
@@ -1327,16 +1634,113 @@ class ClipInferenceNode(Node):
         color_msg: RosImage,
         segment_msg: RosImage,
     ) -> None:
-        """한 frame의 모든 positive segment에 embedding을 부여한다."""
-        rgb_image = self.bridge.imgmsg_to_cv2(
-            color_msg,
-            desired_encoding="rgb8",
+        """순차 경로. 두 단계를 그대로 이어 붙인 것이다.
+
+        파이프라인 모드가 부르는 것과 **같은 두 함수**라, 결과가 달라질
+        여지가 구조적으로 없다.
+        """
+        work = self.preprocess_frame(
+            color_msg=color_msg,
+            segment_msg=segment_msg,
         )
 
-        labels = self.bridge.imgmsg_to_cv2(
-            segment_msg,
-            desired_encoding="mono8",
+        if work is None:
+            return
+
+        self.infer_frame(work)
+
+    def submit_frame(
+        self,
+        color_msg: RosImage,
+        segment_msg: RosImage,
+    ) -> None:
+        """파이프라인 경로 1단계. 콜백 스레드에서 돈다."""
+        work = self.preprocess_frame(
+            color_msg=color_msg,
+            segment_msg=segment_msg,
         )
+
+        if work is None:
+            return
+
+        self.offer(work)
+
+    def offer(self, work: FrameWork) -> None:
+        """준비된 프레임을 큐에 넣는다. 가득 차면 **가장 오래된 것**을 버린다.
+
+        입력이 처리 속도보다 빠를 때 오래된 프레임을 쌓아 두면 지연만 늘고
+        내보내는 결과는 계속 과거가 된다. 최신 프레임을 우선한다.
+
+        생산자와 소비자가 각각 하나뿐인 FIFO 라, 버리기는 맨 앞에서만
+        일어나고 순서는 절대 뒤바뀌지 않는다.
+        """
+        work.queued_at = time.perf_counter()
+
+        while True:
+            try:
+                self.pipeline_queue.put_nowait(work)
+                return
+
+            except queue.Full:
+                try:
+                    self.pipeline_queue.get_nowait()
+
+                    with self.stats_lock:
+                        self.stage_totals.dropped += 1
+
+                except queue.Empty:
+                    # 그 사이 소비자가 가져갔다. 다시 시도한다.
+                    pass
+
+    def pipeline_worker(self) -> None:
+        """파이프라인 경로 2단계 전용 스레드."""
+        while True:
+            work = self.pipeline_queue.get()
+
+            # 종료 신호
+            if work is None:
+                return
+
+            try:
+                self.infer_frame(work)
+
+            except Exception as error:
+                self.get_logger().error(
+                    f"CLIP frame inference failed: {error}"
+                )
+
+    def stop_pipeline(self) -> None:
+        """워커를 정리한다. destroy_node 에서 부른다."""
+        if self.pipeline_thread is None:
+            return
+
+        self.pipeline_queue.put(None)
+        self.pipeline_thread.join(timeout=5.0)
+        self.pipeline_thread = None
+
+    def destroy_node(self) -> bool:
+        self.stop_pipeline()
+
+        return super().destroy_node()
+
+    # ----------------------------------------------------------------
+    # Stage 1 : CPU 전처리
+    # ----------------------------------------------------------------
+
+    def preprocess_frame(
+        self,
+        color_msg: RosImage,
+        segment_msg: RosImage,
+    ) -> Optional[FrameWork]:
+        """cv_bridge 변환 + region 만들기 + 224 전처리까지.
+
+        GPU 를 쓰기는 하지만(H2D, 정규화) 엔진은 건드리지 않는다. 반환한
+        FrameWork 는 다른 스레드의 infer_frame() 에 그대로 넘길 수 있다.
+        """
+        arrived_at = time.perf_counter()
+
+        rgb_image = self.image_from_message(color_msg, "rgb8", 3)
+        labels = self.image_from_message(segment_msg, "mono8", 1)
 
         if rgb_image.shape[:2] != labels.shape[:2]:
             self.get_logger().error(
@@ -1344,12 +1748,76 @@ class ClipInferenceNode(Node):
                 f"rgb={rgb_image.shape[:2]}, "
                 f"labels={labels.shape[:2]}"
             )
-            return
+            return None
 
-        segment_ids, regions, masks, boxes = self.build_regions(
-            rgb_image=rgb_image,
-            labels=labels,
+        if self.preprocess_path == "pil":
+            segment_ids, regions, masks, boxes = self.build_regions(
+                rgb_image=rgb_image,
+                labels=labels,
+                with_masks=self.needs_region_masks,
+            )
+
+            prepared = (
+                self.backend.prepare(
+                    regions=regions,
+                    masks=masks,
+                    pooling_mode=self.pooling_mode,
+                )
+                if segment_ids
+                else None
+            )
+        else:
+            # GPU 경로. crop 복사 / 마스크 / PIL 을 만들지 않으므로 regions 와
+            # masks 는 비어 있다 (디버그 저장이 그걸 보고 건너뛴다).
+            segment_ids, crop_boxes, boxes = self.scan_segments(labels)
+
+            regions = []
+            masks = []
+
+            prepared = (
+                prepare_from_frame(
+                    backend=self.backend,
+                    rgb_image=rgb_image,
+                    labels=labels,
+                    segment_ids=segment_ids,
+                    boxes=crop_boxes,
+                    pooling_mode=self.pooling_mode,
+                    preprocess_path=self.preprocess_path,
+                )
+                if segment_ids
+                else None
+            )
+
+        return FrameWork(
+            stamp=color_msg.header.stamp,
+            header=color_msg.header,
+            segment_ids=segment_ids,
+            regions=regions,
+            masks=masks,
+            boxes=boxes,
+            prepared=prepared,
+            arrived_at=arrived_at,
+            preprocess_ms=(time.perf_counter() - arrived_at) * 1000.0,
         )
+
+    # ----------------------------------------------------------------
+    # Stage 2 : 엔진 + 후처리 + 발행
+    # ----------------------------------------------------------------
+
+    def infer_frame(self, work: FrameWork) -> None:
+        """한 frame의 모든 positive segment에 embedding을 부여한다."""
+        dequeued_at = time.perf_counter()
+
+        queue_wait_ms = (
+            (dequeued_at - work.queued_at) * 1000.0
+            if work.queued_at
+            else 0.0
+        )
+
+        segment_ids = work.segment_ids
+        regions = work.regions
+        masks = work.masks
+        boxes = work.boxes
 
         if not segment_ids:
             if self.publish_empty_sets:
@@ -1359,21 +1827,40 @@ class ClipInferenceNode(Node):
                 )
 
                 self.publish_embeddings(
-                    timestamp=color_msg.header.stamp,
+                    timestamp=work.stamp,
                     segment_ids=[],
                     embeddings=empty,
                 )
 
                 self.publish_semantic_detections(
-                    header=color_msg.header,
+                    header=work.header,
                     segment_ids=[],
                     boxes=[],
                     embeddings=empty,
                 )
 
+            self.record_stage_times(
+                work=work,
+                queue_wait_ms=queue_wait_ms,
+                encoder_ms=0.0,
+                postprocess_ms=(
+                    time.perf_counter() - dequeued_at) * 1000.0,
+            )
+
             return
 
-        embeddings = self.encode_regions(regions, masks)
+        embeddings = self.backend.run(
+            prepared=work.prepared,
+            batch_size=self.batch_size,
+            normalize=self.normalize_embeddings,
+            gamma=self.patch_weight_gamma,
+            min_patch_occupancy=self.min_patch_occupancy,
+            empty_mask_fallback=self.empty_mask_fallback,
+        )
+
+        encoder_done_at = time.perf_counter()
+
+        embeddings = self.apply_alignment(embeddings)
 
         # 가중평균 pooling 경로에서만 채워진다. cls 경로는 None.
         stats = self.backend.last_pooling_stats
@@ -1411,7 +1898,7 @@ class ClipInferenceNode(Node):
             stats = stats.select(keep)
 
         self.log_frame(
-            timestamp=color_msg.header.stamp,
+            timestamp=work.stamp,
             segment_ids=segment_ids,
             embeddings=embeddings,
             stats=stats,
@@ -1425,26 +1912,230 @@ class ClipInferenceNode(Node):
         )
 
         self.publish_embeddings(
-            timestamp=color_msg.header.stamp,
+            timestamp=work.stamp,
             segment_ids=segment_ids,
             embeddings=embeddings,
         )
 
         self.publish_semantic_detections(
-            header=color_msg.header,
+            header=work.header,
             segment_ids=segment_ids,
             boxes=boxes,
             embeddings=embeddings,
         )
 
+        self.record_stage_times(
+            work=work,
+            queue_wait_ms=queue_wait_ms,
+            encoder_ms=(encoder_done_at - dequeued_at) * 1000.0,
+            postprocess_ms=(
+                time.perf_counter() - encoder_done_at) * 1000.0,
+            segments=len(segment_ids),
+        )
+
+    # ----------------------------------------------------------------
+    # 계측
+    # ----------------------------------------------------------------
+
+    def record_stage_times(
+        self,
+        work: FrameWork,
+        queue_wait_ms: float,
+        encoder_ms: float,
+        postprocess_ms: float,
+        segments: int = 0,
+    ) -> None:
+        """단계별 소요시간을 누적하고 필요하면 한 줄 요약을 찍는다.
+
+        단계 구분:
+            preprocess  cv_bridge + build_regions + backend.prepare
+                        (224 기하, H2D, 정규화, 패치 점유율까지)
+            queue wait  1단계가 큐에 넣은 뒤 2단계가 꺼낼 때까지
+                        (순차 모드에서는 항상 0)
+            encoder     backend.run  -- 엔진 실행, D2H, 빈마스크 fallback,
+                        L2 정규화까지
+            postprocess 정렬행렬 + keep 필터 + 로그/디버그 + 두 번의 publish
+            latency     두 입력의 짝이 맞춰진 시각부터 발행이 끝날 때까지
+        """
+        finished_at = time.perf_counter()
+        latency_ms = (finished_at - work.arrived_at) * 1000.0
+
+        with self.stats_lock:
+            totals = self.stage_totals
+
+            totals.frames += 1
+            totals.segments += segments
+            totals.preprocess_ms += work.preprocess_ms
+            totals.queue_wait_ms += queue_wait_ms
+            totals.encoder_ms += encoder_ms
+            totals.postprocess_ms += postprocess_ms
+            totals.latency_ms += latency_ms
+            totals.latency_max_ms = max(totals.latency_max_ms, latency_ms)
+            totals.finished_at = finished_at
+
+            if self.stats_every <= 0:
+                return
+
+            if totals.frames % self.stats_every != 0:
+                return
+
+            snapshot = totals
+            self.stage_totals = StageTotals(started_at=finished_at)
+
+        self.log_stage_times(snapshot)
+
+    def log_stage_times(self, totals: StageTotals) -> None:
+        """창 하나의 평균을 한 줄로 찍는다. 벤치마크가 이 줄을 읽는다."""
+        frames = max(1, totals.frames)
+        elapsed = max(1e-9, totals.finished_at - totals.started_at)
+
+        self.get_logger().info(
+            "STAGE "
+            f"frames={totals.frames} "
+            f"fps={frames / elapsed:.2f} "
+            f"pre={totals.preprocess_ms / frames:.3f} "
+            f"queue={totals.queue_wait_ms / frames:.3f} "
+            f"enc={totals.encoder_ms / frames:.3f} "
+            f"post={totals.postprocess_ms / frames:.3f} "
+            f"latency={totals.latency_ms / frames:.3f} "
+            f"latency_max={totals.latency_max_ms:.3f} "
+            f"segments={totals.segments / frames:.1f} "
+            f"dropped={totals.dropped}"
+        )
+
+    def image_from_message(self, message, encoding: str, channels: int):
+        """sensor_msgs/Image -> ndarray. 인코딩이 맞으면 **복사하지 않는다**.
+
+        cv_bridge 는 desired_encoding 을 주면 인코딩이 이미 같아도 배열을
+        복사한다 (실측 720x480 rgb8 + mono8 두 장에 0.256ms, owndata=True).
+        메시지 버퍼 위의 뷰로 충분하다 -- 0.002ms 이고 값은 같음을 확인했다.
+        crop 은 어차피 .copy() 를 하고, 라벨은 읽기만 한다.
+
+        인코딩이 다르면 cv_bridge 로 넘긴다 (변환이 실제로 필요한 경우다).
+        """
+        if message.encoding != encoding:
+            return self.bridge.imgmsg_to_cv2(
+                message, desired_encoding=encoding)
+
+        height, width = int(message.height), int(message.width)
+
+        step = int(message.step) or width * channels
+
+        view = np.frombuffer(message.data, dtype=np.uint8)
+
+        # step 이 width*channels 보다 크면 행 끝에 패딩이 있다.
+        frame = view[:height * step].reshape(height, step)
+        frame = frame[:, :width * channels]
+
+        if channels == 1:
+            return frame
+
+        return frame.reshape(height, width, channels)
+
+    def crop_bounds(
+        self,
+        bounds: Tuple[int, int, int, int],
+        shape: Tuple[int, ...],
+    ) -> Tuple[int, int, int, int]:
+        """tight bbox -> 실제로 crop 할 영역. bbox_padding 을 붙이고 잘라낸다.
+
+        **build_region() 과 GPU 경로가 같은 함수를 써야 한다.** 이 계산이
+        갈리면 두 전처리 경로가 몇 픽셀 어긋난 crop 을 만들고, 그 상태로 잰
+        임베딩 비교는 의미가 없어진다 (개발 중 실제로 겪었다 -- GPU 경로가
+        패딩을 빼먹어 4px 어긋난 crop 끼리 비교하고 있었다).
+        """
+        height, width = shape[:2]
+
+        return (
+            max(int(bounds[0]) - self.bbox_padding, 0),
+            max(int(bounds[1]) - self.bbox_padding, 0),
+            min(int(bounds[2]) + self.bbox_padding, width),
+            min(int(bounds[3]) + self.bbox_padding, height),
+        )
+
+    def scan_segments(
+        self,
+        labels: np.ndarray,
+    ) -> Tuple[
+        List[int],
+        List[Tuple[int, int, int, int]],
+        List[Tuple[int, int, int, int]],
+    ]:
+        """라벨 프레임에서 (segment_ids, crop_boxes, tight_boxes) 만 뽑는다.
+
+        build_regions() 의 앞부분과 같은 스캔이지만 crop 복사 / 마스크 생성 /
+        PIL 변환을 하지 않는다. GPU 전처리 경로가 이걸 쓴다 -- 그 경로는
+        프레임 한 장과 박스만 있으면 224 를 만들 수 있으므로 crop 을 만드는
+        것이 순수한 낭비다 (실측 4.0ms).
+
+        **GPU 로 옮기려다 되돌렸다.** 라벨맵이 점유율 때문에 어차피 GPU 로
+        올라가니 여기서 scatter_reduce 로 라벨별 행/열 min·max 를 구하면 공짜일
+        것 같았다. 값은 정확히 같았지만 **더 느렸다 (3.48ms vs 2.25ms)**.
+        원인은 345,600개 원소를 256개 bin 에 atomic 으로 모으는 경합과, int64
+        승격(2.7MB 할당) 그리고 결과를 읽으려면 D2H 동기화가 필요한 것이다.
+        bin 수를 늘려 경합을 줄이는 변형(label*H+row 로 bincount)도 있지만
+        CPU 2.25ms 를 이길 여지가 크지 않아 접었다.
+
+        **두 종류의 박스를 구분해서 돌려준다.**
+            crop_boxes   bbox_padding 이 들어간 실제 crop 영역. 전처리가 쓴다.
+            tight_boxes  마스크의 tight bbox. semantics 발행이 쓴다.
+        섞으면 pil 경로와 어긋난 crop 을 만든다 (crop_bounds 주석 참고).
+        """
+        areas = cv2.calcHist(
+            [labels], [0], None,
+            [MAX_SEGMENT_ID + 1], [0, MAX_SEGMENT_ID + 1],
+        ).ravel()
+
+        present = np.nonzero(areas)[0]
+        present = present[present != BACKGROUND_SEGMENT_ID]
+
+        self.last_candidate_count = int(present.size)
+        self.last_skipped_count = 0
+
+        segment_ids: List[int] = []
+        crop_boxes: List[Tuple[int, int, int, int]] = []
+        tight_boxes: List[Tuple[int, int, int, int]] = []
+
+        if not present.size:
+            return segment_ids, crop_boxes, tight_boxes
+
+        found = ndimage.find_objects(labels, max_label=int(present[-1]))
+
+        for segment_id in present.tolist():
+            if areas[segment_id] < self.min_segment_pixels:
+                self.last_skipped_count += 1
+
+                continue
+
+            box = found[segment_id - 1]
+
+            if box is None:
+                continue
+
+            row_slice, column_slice = box
+
+            bounds = (
+                int(column_slice.start),
+                int(row_slice.start),
+                int(column_slice.stop),
+                int(row_slice.stop),
+            )
+
+            segment_ids.append(segment_id)
+            tight_boxes.append(bounds)
+            crop_boxes.append(self.crop_bounds(bounds, labels.shape))
+
+        return segment_ids, crop_boxes, tight_boxes
+
     def build_regions(
         self,
         rgb_image: np.ndarray,
         labels: np.ndarray,
+        with_masks: bool = True,
     ) -> Tuple[
         List[int],
         List[PILImage.Image],
-        List[PILImage.Image],
+        List[Optional[np.ndarray]],
         List[Tuple[int, int, int, int]],
     ]:
         """
@@ -1452,44 +2143,41 @@ class ClipInferenceNode(Node):
 
         반환되는 segment_ids / regions / masks / boxes는 같은 순서를 유지하며,
         이 순서가 InstanceEmbeddingSet의 row 순서가 된다.
-        masks[i]는 regions[i]와 정확히 같은 크기의 binary mask이며
-        가중평균 pooling의 패치 점유율 계산에 쓴다.
+        masks[i]는 regions[i]와 정확히 같은 크기의 binary mask(bool ndarray)이며
+        가중평균 pooling의 패치 점유율 계산에 쓴다. 백엔드가 224로 늘리지 않고
+        바로 7x7 점유율로 접으므로 PIL로 바꾸지 않는다
+        (clip_backend.patch_occupancy_from_masks 주석 참고).
+        디버그 저장만 mask_to_image()로 PIL을 만든다.
         boxes는 마스크의 tight bbox (x0, y0, x1, y1)이며 semantics 발행에 쓴다.
+
+        with_masks=False면 masks[i]는 None이다. cls pooling은 마스크를 쓰지
+        않으므로 노드의 프레임 경로가 이걸로 마스크 생성을 건너뛴다.
+
+        **기본값이 True인 것이 중요하다.** tools/의 벤치마크들은 첫 모드의
+        노드로 crop을 한 번 만들어 나머지 모드에 그대로 넘긴다 -- 세 모드가
+        같은 crop을 공유해야 pooling 차이만 분리되기 때문이다. 여기서
+        pooling_mode를 보고 마스크를 생략하면 첫 모드가 cls일 때 뒤따르는
+        마스크 모드들이 None을 받아 조용히 망가진다 (실측: value 87.92%
+        -> 76.08%, patch 7.87% -> 35.26%). 그래서 생략 여부는 인스턴스
+        상태가 아니라 **호출자가 명시**한다.
         """
-        unique_ids = np.unique(labels)
+        # 스캔은 scan_segments() 하나만 쓴다. 여기서 다시 구현하면 GPU 경로와
+        # 갈라진다 (crop_bounds 주석 참고).
+        candidates, crop_boxes, tight_boxes = self.scan_segments(labels)
 
         segment_ids: List[int] = []
         regions: List[PILImage.Image] = []
-        masks: List[PILImage.Image] = []
+        masks: List[Optional[np.ndarray]] = []
         boxes: List[Tuple[int, int, int, int]] = []
 
-        candidates = 0
-        skipped = 0
-
-        for raw_id in unique_ids:
-            segment_id = int(raw_id)
-
-            # 0은 background/invalid
-            if segment_id == BACKGROUND_SEGMENT_ID:
-                continue
-
-            candidates += 1
-
-            mask = labels == segment_id
-
-            if int(mask.sum()) < self.min_segment_pixels:
-                skipped += 1
-                continue
-
-            bounds = self.mask_bounds(mask)
-
-            if bounds is None:
-                continue
-
+        for segment_id, crop_box, bounds in zip(
+                candidates, crop_boxes, tight_boxes):
             built = self.build_region(
                 rgb_image=rgb_image,
-                mask=mask,
-                bounds=bounds,
+                labels=labels,
+                segment_id=segment_id,
+                bounds=crop_box,
+                with_mask=with_masks,
             )
 
             if built is None:
@@ -1502,69 +2190,62 @@ class ClipInferenceNode(Node):
             masks.append(region_mask)
             boxes.append(bounds)
 
-        self.last_candidate_count = candidates
-        self.last_skipped_count = skipped
-
         return segment_ids, regions, masks, boxes
 
     @staticmethod
-    def mask_bounds(
-        mask: np.ndarray,
-    ) -> Optional[Tuple[int, int, int, int]]:
-        """마스크를 감싸는 tight bbox (x0, y0, x1, y1)을 구한다."""
-        rows = np.nonzero(mask.any(axis=1))[0]
-        columns = np.nonzero(mask.any(axis=0))[0]
-
-        if rows.size == 0 or columns.size == 0:
-            return None
-
-        return (
-            int(columns[0]),
-            int(rows[0]),
-            int(columns[-1]) + 1,
-            int(rows[-1]) + 1,
-        )
-
-    @staticmethod
     def mask_to_image(mask: np.ndarray) -> PILImage.Image:
-        """마스크 배열을 백엔드가 받는 grayscale 이미지로 바꾼다."""
+        """마스크 배열을 백엔드가 받는 grayscale 이미지로 바꾼다.
+
+        bool 은 numpy 에서 1바이트라 view 로 uint8 을 공짜로 얻는다.
+        astype 을 쓰면 배열을 한 번 더 복사한다. 호출부가 넘기는 마스크는
+        모두 == 비교의 결과라 C-contiguous 이고, view 의 전제가 이것이다.
+        """
         return PILImage.fromarray(
-            mask.astype(np.uint8) * 255
+            mask.view(np.uint8) * 255
         )
 
     def build_region(
         self,
         rgb_image: np.ndarray,
-        mask: np.ndarray,
+        labels: np.ndarray,
+        segment_id: int,
         bounds: Tuple[int, int, int, int],
-    ) -> Optional[Tuple[PILImage.Image, PILImage.Image]]:
+        with_mask: bool = True,
+    ) -> Optional[Tuple[PILImage.Image, Optional[np.ndarray]]]:
         """crop_policy에 따라 segment 하나의 (RGB region, mask)를 구성한다.
 
         두 이미지는 항상 같은 크기다. 백엔드가 여기에 같은 resize/crop을
         적용하므로, 크기가 어긋나면 패치 점유율과 patch token의 위치 대응이
         깨진다.
+
+        마스크는 **필요한 범위에서만** 만든다. 프레임 전체 크기의 bool 배열이
+        필요한 것은 masked_full 뿐이고, 나머지 두 정책은 bbox 안만 있으면
+        된다. 세그먼트마다 640x480 배열을 만들던 비용이 여기서 사라진다.
+
+        bounds 는 **이미 crop_bounds() 를 거친 crop 영역**이다 (tight bbox 가
+        아니다). 패딩 계산이 scan_segments() 한 곳에만 있어야 GPU 경로와
+        갈라지지 않는다 -- crop_bounds 주석 참고.
         """
         if self.crop_policy == "masked_full":
+            mask = labels == segment_id
+
             region = rgb_image.copy()
             region[~mask] = self.mask_fill
 
             return (
                 PILImage.fromarray(region),
-                self.mask_to_image(mask),
+                mask if with_mask else None,
             )
 
-        height, width = mask.shape[:2]
-
-        tight_x0, tight_y0, tight_x1, tight_y1 = bounds
-
-        y0 = max(tight_y0 - self.bbox_padding, 0)
-        y1 = min(tight_y1 + self.bbox_padding, height)
-
-        x0 = max(tight_x0 - self.bbox_padding, 0)
-        x1 = min(tight_x1 + self.bbox_padding, width)
+        # bounds 는 호출부(scan_segments)가 이미 crop_bounds() 로 만든 **crop
+        # 영역**이다. 여기서 다시 패딩을 붙이면 이중 적용이 된다.
+        x0, y0, x1, y1 = bounds
 
         region = rgb_image[y0:y1, x0:x1].copy()
-        region_mask = mask[y0:y1, x0:x1]
+
+        # crop 안에서만 마스크를 만든다. == 의 결과라 새 C-contiguous 배열이고,
+        # mask_to_image 의 view 가 이것을 전제한다.
+        region_mask = labels[y0:y1, x0:x1] == segment_id
 
         if self.crop_policy == "masked_bbox":
             # bbox 안에서도 다른 object의 픽셀은 배제한다.
@@ -1572,13 +2253,13 @@ class ClipInferenceNode(Node):
 
         return (
             PILImage.fromarray(region),
-            self.mask_to_image(region_mask),
+            region_mask if with_mask else None,
         )
 
     def encode_regions(
         self,
         regions: List[PILImage.Image],
-        masks: Optional[List[PILImage.Image]] = None,
+        masks: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         """
         region들을 batch로 CLIP image encoder에 통과시킨다.
@@ -1632,6 +2313,8 @@ class ClipInferenceNode(Node):
             return None
 
         resolved = path or TEXT_ALIGNMENT_MATRICES.get(self.pooling_mode, "")
+        if self.model_dir and not path and resolved:
+            resolved = str(Path(self.model_dir) / Path(resolved).expanduser().name)
 
         if not resolved:
             return None
@@ -1795,7 +2478,7 @@ class ClipInferenceNode(Node):
         self,
         segment_ids: List[int],
         regions: List[PILImage.Image],
-        masks: List[PILImage.Image],
+        masks: List[np.ndarray],
         stats=None,
     ) -> None:
         """이미지 / 마스크 / 점유율 세 장을 같은 좌표계로 저장한다.
@@ -1808,6 +2491,19 @@ class ClipInferenceNode(Node):
             return
 
         if self.debug_save_every <= 0:
+            return
+
+        # GPU 전처리 경로는 crop 과 마스크를 CPU 에 만들지 않는다. 디버그 저장은
+        # 그 두 장을 겹쳐 보는 것이 목적이라, 없으면 저장할 것이 없다.
+        # 정렬을 눈으로 확인해야 하면 --preprocess-path pil 로 한 번 돌린다.
+        if len(regions) != len(segment_ids):
+            if self.frame_count % self.debug_save_every == 0:
+                self.get_logger().warn(
+                    "디버그 이미지 저장을 건너뜁니다: "
+                    f"preprocess_path='{self.preprocess_path}' 는 crop/마스크를 "
+                    "만들지 않습니다. pil 경로로 돌리세요."
+                )
+
             return
 
         if self.frame_count % self.debug_save_every != 0:
@@ -1824,7 +2520,9 @@ class ClipInferenceNode(Node):
             crop = self.debug_rgb_geometry(regions[row])
             crop.save(directory / f"{prefix}_crop.png")
 
-            mask_image = self.debug_mask_geometry(masks[row])
+            mask_image = self.debug_mask_geometry(
+                self.mask_to_image(masks[row])
+            )
             mask_image.save(directory / f"{prefix}_mask.png")
 
             # 7x7 점유율을 crop과 같은 크기로 확대해 겹쳐볼 수 있게 한다.
@@ -1894,8 +2592,14 @@ class ClipInferenceNode(Node):
         output_msg.embedding_dim = self.embedding_dim
 
         # row-major flattened [N, D]
-        output_msg.embeddings = (
-            embeddings.reshape(-1).tolist()
+        #
+        # tolist() 로 넘기면 rclpy 가 원소 16384개를 하나씩 float 타입/범위
+        # 검사한다 (실측 2.96ms, 그중 tolist 자체는 0.28ms 뿐이다).
+        # array("f") 는 필드 타입과 정확히 같아서 그 검사를 건너뛴다
+        # (0.007ms). 바이트가 그대로 들어가므로 값은 동일하다.
+        output_msg.embeddings = array(
+            "f",
+            np.ascontiguousarray(embeddings, dtype=np.float32).tobytes(),
         )
 
         self.embedding_publisher.publish(
@@ -2017,6 +2721,7 @@ def main(args=None) -> None:
         log_values=cli.log_values,
         log_max_segments=cli.log_max_segments,
         backend=cli.backend,
+        model_dir=cli.model_dir,
         engine_path=cli.engine_path,
         pooled_engine_path=cli.pooled_engine_path,
         value_engine_path=cli.value_engine_path,
@@ -2035,16 +2740,22 @@ def main(args=None) -> None:
         debug_save_every=cli.debug_save_every,
         use_cuda=cli.use_cuda,
         crop_policy=cli.crop_policy,
+        preprocess_path=cli.preprocess_path,
         mask_fill=cli.mask_fill,
         bbox_padding=cli.bbox_padding,
         min_segment_pixels=cli.min_segment_pixels,
         batch_size=cli.batch_size,
+        preprocess_workers=cli.preprocess_workers,
+        async_preprocess=cli.async_preprocess,
         normalize_embeddings=cli.normalize_embeddings,
         sync_buffer_size=cli.sync_buffer_size,
         publish_empty_sets=cli.publish_empty_sets,
         qos_depth=cli.qos_depth,
         reliable_input=cli.reliable_input,
         reliable_output=cli.reliable_output,
+        pipeline_enabled=cli.pipeline_enabled,
+        pipeline_queue_depth=cli.pipeline_queue_depth,
+        stats_every=cli.stats_every,
     )
 
     try:
