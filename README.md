@@ -512,37 +512,16 @@ ros2 run meridian_clip embedding_monitor
 | `--text-alignment-matrix` | `""` (모드별 자동) | 텍스트 쪽 정렬. `none` 이면 끔, §3 |
 | `--alignment-matrix` | `""` | 이미지 쪽 정렬. 보통 불필요, §3 |
 | `--crop-fit` | `pad` | §4 |
+| `--preprocess-path` | `pil` | 224 를 어디서 만들지. `interp_aa` / `roi_align` 은 GPU 경로, §6 |
 | `--crop-policy` | `bbox` | `masked_bbox` / `masked_full` 도 있음, §4 |
 | `--patch-weight-gamma` | 1.0 | `w = r^gamma`. 1.0 이면 점유율 그대로 |
 | `--min-patch-occupancy` | 0.0 | 이보다 낮은 패치는 가중치 0 |
 | `--empty-mask-fallback` | `cls` | 가중치 합이 0 일 때. `skip` / `error` 도 있음 |
 | `--min-segment-pixels` | 16 | 이보다 작은 세그먼트는 건너뜀 |
-| `--preprocess-workers` | 8 | 224 기하를 만드는 스레드 수 |
-| `--async-preprocess` | `false` | 전처리를 청크 단위로 엔진과 겹칠지 |
-| `--model-dir` | `""` | 모델 파일 경로들의 디렉터리를 한 번에 교체 |
 | `--prompts` / `--prompt-file` | 18개 기본값 | zero-shot 후보 |
 | `--debug-save-dir` | `""` | crop/mask/occupancy PNG 저장 |
 
 `gamma` 와 `min_patch_occupancy` 는 **엔진 밖에서** 적용되므로 바꿔도 재빌드가 필요 없다.
-
-> **`--async-preprocess` 는 기본이 꺼짐이다.** 켜면 PIL 기하를 future 로 던져 놓고
-> 청크마다 꺼내 써서 CPU resize 와 엔진을 겹친다. 워커가 적을 때만 이득이다
-> (Jetson Orin 12코어, N=32): workers=1 은 27.1→32.1 FPS, workers=2 는 38.1→41.7 FPS
-> 로 오르지만 workers=4 는 43.8→43.0, workers=8 은 44.8→43.1 로 **내려간다**.
-> 워커가 CPU 를 이미 채우고 나면 엔진 대기 중에 돌릴 여유가 없고, §6 의 2-stage
-> pipeline 에서는 Stage1/Stage2 균형까지 깨진다 (cls 기준 Pre 17.6→5.3ms,
-> Enc 17.9→29.2ms, queue 1.9→26.0ms, 처리량 50.1→45.2 FPS). GPU 가 훨씬 빠른
-> 장비에서만 켜 볼 만하다. 켜고 끄고에 따라 **결과 임베딩은 바뀌지 않는다** —
-> 기하/정규화 수식은 같고 실행 스케줄만 다르다.
-
-> **`--model-dir`** 은 `--engine-path` / `--pooled-engine-path` / `--value-engine-path` /
-> `--text-engine-path` / `--model-path` 와 정렬 행렬까지, 노드가 읽는 모델 파일의
-> **디렉터리만** 한 번에 갈아끼운다 (파일 이름은 그대로). `models/` 를 다른 곳에
-> 복사해 두고 돌릴 때 인자 하나로 끝난다.
->
-> ```bash
-> ros2 run meridian_clip clip_inference_node --model-dir ~/clip_bench_code/models
-> ```
 
 > **빈 마스크 처리** — crop 을 224 로 늘렸을 때 49개 패치 점유율이 전부 0 이 되는
 > 아주 작은 세그먼트가 생긴다. 기본값 `cls` 는 같은 forward 의 CLS 임베딩으로 대체하는데,
@@ -573,43 +552,7 @@ python3 meridian_clip/build_engine.py --part visual_pooled_value \
 
 `--part visual` / `visual_pooled` 도 같은 인자로 빌드한다. 하드웨어는 RTX 2080 Ti /
 12코어, 입력 640x480, TensorRT fp16, `--crop-fit pad` / `--crop-policy bbox`.
-
-```bash
-# 현재 코드
-python3 tools/benchmark_stages.py --segments 32
-
-# 최적화 전 코드와 나란히 (src/meridian_clip_backup 필요)
-python3 tools/benchmark_stages.py --variant both --segments 32
-```
-
-데이터셋이 필요 없다 -- 640x480 프레임에 타원 블롭 N개를 깔아 라벨맵을 합성하므로
-카메라도 FastSAM 도 없이 돌고, `RandomState(seed)` 라 어느 머신에서든 입력이 같다.
-
-#### 속도와 정확도는 성질이 다르다
-
-| | 실행 간 변동 |
-|---|---|
-| **정확도** | **없다.** 3회 반복이 소수점까지 일치한다 |
-| **속도** | 도구 실행 단위로 ±3%, 구간별 이상치는 최대 2배 |
-
-**값이 달라졌다면 정확도는 코드가 달라진 것이고, 속도는 그냥 노이즈일 수 있다.**
-
-속도 변동의 출처는 두 가지다.
-
-- **GPU 클럭.** 프레임의 44%만 GPU 가 일해서 드라이버가 계속 클럭을 올렸다 내렸다
-  한다. 측정 시작 시점이 735MHz 일 때와 1485MHz 일 때가 섞인다. 엔진 시간이 7.4~8.0ms
-  로 ±8% 흔들리는 이유다. 머신 간 비교나 회귀 측정을 할 거면
-  `sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1900` 으로 **양쪽 다 고정**해야 한다
-- **웜업.** 도구를 새로 띄우면 엔진 로드와 CUDA 컨텍스트 초기화가 첫 측정에 섞인다.
-  프레임 웜업 10장으로는 부족하다
-
-그래서 **도구를 3회 이상 돌린 중앙값**으로 보고한다. 단발 측정값을 인용하면 4% 차이가
-회귀처럼 보인다 (실제로 이 문서를 쓰는 동안 한 번 그랬다).
-
-> 구간별로 재면 이상치가 커 보인다 -- 50프레임 기준 `build_regions` 는 중앙값 1.92ms
-> 인데 최대 3.31ms, 점유율은 0.76ms 인데 최대 1.23ms 다. **마스크 유무와 무관하게
-> 모든 구간이 똑같이 튄다** (GC·스레드 선점 등 시스템 지터). `benchmark_stages.py` 는
-> 40프레임 중앙값을 내므로 이건 이미 걸러진다.
+실행 간 변동은 ±5% 정도다.
 
 > **프로파일의 min/max 는 세그먼트 개수를 고정하는 설정이 아니다.** 엔진이 받을 수
 > 있는 배치 크기의 범위일 뿐이다. 프레임 처리 시간이 세그먼트 수 N 에 비례하는 것은
@@ -620,19 +563,26 @@ python3 tools/benchmark_stages.py --variant both --segments 32
 
 | 단계 | `cls` | `mask_weighted_value` **(기본값)** | `mask_weighted_patch` |
 |---|---|---|---|
-| **Preprocessing** | **9.358** (55.6%) | **9.983** (54.9%) | **9.579** (53.5%) |
-| **CLIP Encoder** | **7.243** (43.0%) | **7.984** (43.9%) | **8.092** (45.2%) |
-| **Postprocessing** | **0.230** (1.4%) | **0.232** (1.3%) | **0.233** (1.3%) |
-| **합계** | **16.832 ms** | **18.200 ms** | **17.904 ms** |
-| **FPS** | **59.4** | **54.9** | **55.9** |
-| 세그먼트 1개당 | 0.526 ms | 0.569 ms | 0.559 ms |
+| 세그먼트 분해 + bbox crop | 2.404 | 2.373 | 2.326 |
+| 224 전처리 — RGB | 7.208 | 6.879 | 6.825 |
+| 224 전처리 — 마스크 | — | 2.909 | 2.662 |
+| 패치 점유율 + 가중치 | — | 0.223 | 0.228 |
+| **TensorRT 엔진** | **7.915** | **8.351** | **8.335** |
+| D2H + 빈마스크 판정 | 0.088 | 0.218 | 0.211 |
+| L2 정규화 + 정렬 | 0.060 | 0.049 | 0.050 |
+| zero-shot 유사도 + top-k | 0.045 | 0.043 | 0.045 |
+| 메시지 빌드 + publish | 1.503 | 1.492 | 1.484 |
+| **Preprocessing** | **9.611** (50.0%) | **12.384** (54.9%) | **12.041** (54.3%) |
+| **CLIP Encoder** | **7.915** (41.2%) | **8.351** (37.1%) | **8.335** (37.6%) |
+| **Postprocessing** | **1.697** (8.8%) | **1.803** (8.0%) | **1.790** (8.1%) |
+| **합계** | **19.224 ms** | **22.537 ms** | **22.165 ms** |
+| **FPS** | **52.0** | **44.4** | **45.1** |
+| 세그먼트 1개당 | 0.601 ms | 0.704 ms | 0.693 ms |
 
-재현: `python3 tools/benchmark_stages.py --segments 32`
-
-**세 모드가 이제 거의 같다.** 마스크 모드의 전처리 우위가 사라진 것은 점유율 직행
-경로(아래 (3)) 덕분이다 — 마스크를 224 로 늘리지 않으니 `cls` 와 할 일이 거의 같아졌다.
-**엔진은 7.24~8.09ms 로 세 모드가 동일**하고(엔진 파일만 다르고 코드 경로가 같다),
-모드 선택은 **속도가 아니라 정확도 문제다** (§3).
+**세 모드의 차이는 마스크 경로가 전부다.** `cls` 가 3.3ms 빠른데 전부 Preprocessing
+쪽이고(마스크 224 전처리 2.9ms + 점유율 0.22ms), **엔진은 7.92~8.35ms 로 사실상 같다.**
+`value` 와 `patch` 는 22.5 vs 22.2ms 로 구분되지 않는다 — 엔진 파일만 다르고 코드
+경로가 동일하니 당연하다. 모드 선택은 **속도가 아니라 정확도 문제다** (§3).
 
 각 단계에 무엇이 들어가는지:
 
@@ -682,125 +632,6 @@ FastSAM 은 프레임당 최대 255개를 낸다. N=32 가 기준점이지만 �
 N=1 의 6ms 는 프레임 고정비(세그먼트 분해 1.2ms + 배치 1개짜리 엔진의 비효율)가 통째로
 한 세그먼트에 얹힌 값이라 단가가 아니다. N≥16 부터 세그먼트 단가가 수렴한다.
 
-### 224 전처리 경로 4종 비교 (uHumans2 office, 세 모드 전부)
-
-`pre` 가 `enc` 보다 무거운 것이 §6 표의 일관된 결론이고, 그 대부분이 crop 을 224 로
-만드는 구간이다. 그래서 같은 224 를 만드는 다른 경로 셋을 놓고 쟀다.
-
-| 경로 | 방법 |
-|---|---|
-| **`current`** | **배포 경로.** crop → PadToSquare → PIL BICUBIC (CPU) |
-| `roi_align` | 방법 ③. 정사각 ROI 한 번 + band 마스킹, bilinear 고정 |
-| `interp_aa` | 방법 ②-a. 인스턴스별 zero-pad → `interpolate(bicubic, antialias)` |
-| `grid_sample` | 방법 ②-b. 좌표 하나로 접어 batched `grid_sample(bicubic)` |
-
-> **뒤의 셋은 `tools/` 안에만 있다.** `clip_backend.py` 는 여전히 `current` 만 쓴다.
-> 교체 후보를 오프라인에서 재 본 것이지 노드 동작이 바뀐 것이 아니다.
-
-**측정 조건** — `tools/benchmark_uhumans.py`, `uHumans2_office_s1_00h.bag`,
-720x480, 프레임 297장 (`--stride 28 --max-frames 300 --warmup-frames 10`),
-인스턴스 5536개(≥900px), 프롬프트 18종, ROS 노드 경로(post 에 DDS 발행 포함),
-**RTX 2080 Ti / torch 2.2.0+cu118 / TensorRT 10.13.0.35**.
-N 은 고정하지 않는다 — 프레임당 평균 18.6 (중앙값 18, 최소 5, 최대 40),
-crop 배율 중앙값 0.54 로 **76% 가 업스케일**이다.
-`cos` 는 같은 세그먼트를 `current` 로 낸 임베딩과의 코사인(드리프트)이다.
-
-**`cls`** — Wᵀ 정렬 없음 (cls 용 행렬은 존재하지 않는다)
-
-| 경로 | pre | enc | post | 합계 | FPS | top-1 전체 | top-1 thing | cos 평균 | cos p5 | cos 최소 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| current | 9.20 | 5.71 | 0.15 | 15.06 | 66.4 | 27.76% | 49.13% | — | — | — |
-| roi_align | **2.55** | 5.66 | 0.08 | 8.29 | 120.6 | **29.10%** | **50.13%** | 0.9780 | 0.9418 | 0.8274 |
-| interp_aa | 2.64 | 5.69 | 0.07 | 8.39 | 119.1 | 27.57% | 48.26% | **0.9975** | **0.9918** | **0.9588** |
-| grid_sample | 2.80 | 5.27 | 0.07 | **8.14** | **122.9** | 28.78% | 48.53% | 0.9858 | 0.9615 | 0.8974 |
-
-**`mask_weighted_patch`** — Wᵀ = `align_patch_to_cls.npy`
-
-| 경로 | pre | enc | post | 합계 | FPS | top-1 전체 | top-1 thing | cos 평균 | cos p5 | cos 최소 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| current | 10.34 | 5.60 | 0.15 | 16.08 | 62.2 | 16.33% | 52.94% | — | — | — |
-| roi_align | **2.74** | 5.53 | 0.09 | **8.36** | **119.6** | **16.91%** | **55.21%** | 0.9889 | 0.9712 | **0.8992** |
-| interp_aa | 2.92 | 5.91 | 0.08 | 8.90 | 112.4 | 16.38% | 52.74% | **0.9987** | **0.9959** | 0.8984 |
-| grid_sample | 3.05 | 5.55 | 0.08 | 8.68 | 115.3 | 16.62% | 53.68% | 0.9925 | 0.9798 | 0.8907 |
-
-**`mask_weighted_value`** (배포 기본값) — Wᵀ = `align_value_to_cls.npy`
-
-| 경로 | pre | enc | post | 합계 | FPS | top-1 전체 | top-1 thing | cos 평균 | cos p5 | cos 최소 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| current | 10.05 | 5.56 | 0.15 | 15.76 | 63.4 | 31.25% | 55.08% | — | — | — |
-| roi_align | **2.65** | 5.67 | 0.08 | 8.39 | 119.1 | **31.52%** | **56.28%** | 0.9819 | 0.9527 | 0.7645 |
-| interp_aa | 2.77 | 5.86 | 0.07 | 8.70 | 115.0 | 30.82% | 54.55% | **0.9975** | **0.9917** | **0.9027** |
-| grid_sample | 2.91 | 5.38 | 0.07 | **8.35** | **119.7** | 31.20% | 54.81% | 0.9881 | 0.9661 | 0.8825 |
-
-읽는 법:
-
-- **`pre` 가 3.3~3.8배 줄고 `enc` 는 그대로다.** 세 후보 모두 전처리만 바꾸므로 당연하지만,
-  그래서 전체 FPS 가 모드와 무관하게 62~66 → 112~123 으로 **1.8~1.9배**가 된다.
-  `current` 의 `pre` 가 `enc` 의 1.6~1.9배였던 것이 후보 경로에서는 0.5배 안팎으로 뒤집힌다.
-- **경로 간 top-1 차이는 전체 기준 ±1.4%p, thing 기준 ±2.3%p 안쪽이다.** `roi_align` 이
-  세 모드 모두에서 thing 기준 가장 높지만(+1.00 / +2.27 / +1.20%p) 드리프트는 평균·p5
-  기준 셋 중 가장 크다(평균 0.9780~0.9889). `interp_aa` 는 정반대로 `current` 를 거의
-  그대로 재현한다 (평균 0.9975 이상, 최소 0.8984 이상). **바꿔치기 후보로는 `interp_aa`,
-  라벨 정확도만 보면 `roi_align`** 이다.
-- **`cls` 의 `pre` 가 다른 두 모드보다 ~1ms 싸다** (9.20 vs 10.05/10.34). 마스크 PIL 을
-  만들지 않기 때문이고, 후보 경로에서는 그 차이가 0.1~0.3ms 로 줄어든다.
-
-> ⚠ **uHumans2 의 절대 top-1 은 VOC 와 비교할 수 없다.** semantic GT 만 주므로 인스턴스를
-> 연결성분으로 만들고, 라벨 21종 중 여럿이 잡동사니 묶음이다(id 10 = 노트북+머그+키보드+종이…).
-> `patch` 의 전체 16.33% 가 `cls` 의 27.76% 보다 낮은 것도 그 영향이 크다 — thing 기준으로는
-> 52.94% 대 49.13% 로 뒤집힌다. **유효한 신호는 경로 간 Δ 와 드리프트 코사인이지
-> 절대값이 아니다.** 절대 정확도는 바로 아래 VOC2012 표를 본다.
-
-#### 절대 정확도 — VOC2012 val (같은 네 경로, 세 모드)
-
-인스턴스 GT 가 있는 데이터셋이라 절대값이 의미를 갖는다. `tools/benchmark_voc.py`,
-val 1449장 중 세그먼트 있는 것, **인스턴스 2845개**(≥900px), 프롬프트
-`"a photo of a {class}"` 20종. Wᵀ 정렬은 uHumans2 와 같다
-(`cls` 없음 / `patch` `align_patch_to_cls.npy` / `value` `align_value_to_cls.npy`).
-**`grid_bicubic` 이 위 표 `interp_aa`(방법 ②-a)의 VOC 쪽 이름이다.**
-
-| 모드 | 경로 | top-1 | Δ | 평균 마진 | cos 평균 | cos p5 | cos 최소 |
-|---|---|---|---|---|---|---|---|
-| **cls** | current | 84.64% | — | 0.0365 | — | — | — |
-| | roi_align | **84.67%** | +0.03 | 0.0370 | 0.9808 | 0.9435 | 0.8132 |
-| | grid_bicubic | 84.32% | -0.32 | 0.0364 | **0.9991** | **0.9971** | **0.9802** |
-| | grid_sample | 84.36% | -0.28 | 0.0367 | 0.9841 | 0.9486 | 0.8186 |
-| **patch** | current | 90.79% | — | 0.0333 | — | — | — |
-| | roi_align | **90.86%** | +0.07 | 0.0330 | 0.9940 | 0.9814 | 0.9299 |
-| | grid_bicubic | 90.79% | 0.00 | 0.0332 | **0.9996** | **0.9987** | **0.9858** |
-| | grid_sample | 90.62% | -0.17 | 0.0331 | 0.9960 | 0.9864 | 0.9237 |
-| **value** | current | **92.72%** | — | 0.0390 | — | — | — |
-| | roi_align | 92.48% | -0.24 | 0.0390 | 0.9925 | 0.9731 | 0.8777 |
-| | grid_bicubic | 92.58% | -0.14 | 0.0390 | **0.9995** | **0.9982** | **0.9740** |
-| | grid_sample | 92.69% | -0.03 | 0.0389 | 0.9950 | 0.9817 | 0.9095 |
-
-- **네 경로의 top-1 은 어느 모드에서도 0.35%p 안에 들어온다.** 2845개 기준 0.3%p 는
-  10개 남짓이라 경로 선택이 정확도를 유의미하게 바꾸지 않는다. 모드 간 차이
-  (84.6 → 90.8 → 92.7%) 가 경로 간 차이보다 **20배 이상 크다.**
-- **드리프트 순서는 uHumans2 와 완전히 같다.** `grid_bicubic`(=`interp_aa`) 이 세 모드
-  모두 평균 0.999 이상·최소 0.974 이상으로 `current` 를 가장 충실히 재현하고,
-  `roi_align` 과 `grid_sample` 은 최소 0.81~0.93 까지 벌어진다. 두 데이터셋이 같은
-  결론을 주므로 **경로를 바꾼다면 `interp_aa`** 다.
-- 인코딩 시간(5.2~5.8s → 3.5~4.1s)도 같은 방향이지만, 여기 crop 은 VOC 원본 해상도라
-  §6 앞 표의 ms 수치와 직접 비교하지 않는다.
-
-재현:
-
-```bash
-python tools/benchmark_voc.py --package ~/meridian/src/meridian_clip \
-    --voc-root ~/meridian/datasets/VOCdevkit/VOC2012 \
-    --pooling-mode mask_weighted_value \
-    --paths current roi_align grid_bicubic grid_sample
-```
-
-재현:
-
-```bash
-python tools/benchmark_uhumans.py --package ~/meridian/src/meridian_clip \
-    --bag ~/Downloads/uHumans2_office_s1_00h.bag \
-    --pooling-mode mask_weighted_value --stride 28 --max-frames 300
-```
-
 ### 엔진 프로파일의 `opt` 가 실제로 성능을 바꾼다
 
 처음에는 "배치 8부터 이미지당 비용이 평탄하니 배치를 키워도 소용없다"고 판단했는데,
@@ -819,6 +650,48 @@ python tools/benchmark_uhumans.py --package ~/meridian/src/meridian_clip \
 **배치 크기와 `opt` 는 별개 축이다.** 배치만 바꿔서 잰 곡선으로 `opt` 의 효과를 판단하면
 안 된다. 엔진을 다시 빌드하면 fp16 커널 선택이 달라져 top-1 이 0.1%p 안쪽에서 움직이므로
 (3,420개 중 3~4개), 정확도 표를 인용할 때는 어느 빌드인지 함께 봐야 한다.
+
+---
+
+### 224 전처리 경로 3종 (`--preprocess-path`) — Jetson AGX Orin
+
+`pil` 은 crop 을 PIL 로 만들어 CPU 에서 224 로 줄인다(**기본값, 배포 경로**).
+GPU 경로 둘은 crop 을 만들지 않고 프레임 한 장에서 바로 224 를 뽑는다.
+
+> **측정 조건.** uHumans2 office s1_00h, 720x480, `--stride 10`,
+> **831프레임 / 15,544 인스턴스, N 평균 18.7**, batch 32, 점유율 `exact`,
+> Jetson AGX Orin MAXN / torch 2.8.0 / TensorRT 10.3.0. **평균 ms**.
+> 2026-08-24 측정. 위의 §6 표들은 RTX 2080 Ti / 640x480 이므로 **섞어 읽지 않는다.**
+
+| 모드 | 경로 | pre | enc | post | 합계 | FPS | top-1 (things) | cos 평균 | cos 최소 |
+|---|---|---|---|---|---|---|---|---|---|
+| **cls** | `pil` | 14.30 | 10.46 | 0.34 | 25.11 | 39.8 | 48.87% | — | — |
+| | `roi_align` | **6.56** | 10.26 | 0.29 | **17.11** | **58.4** | 51.13% | 0.9795 | 0.8395 |
+| | `interp_aa` | 7.26 | 10.21 | 0.28 | 17.75 | 56.3 | 48.20% | **0.9975** | **0.9463** |
+| **value** | `pil` | 16.15 | 11.55 | 0.34 | 28.05 | 35.7 | 55.56% | — | — |
+| | `roi_align` | **7.68** | 11.18 | 0.31 | **19.17** | **52.2** | 56.08% | 0.9848 | 0.8628 |
+| | `interp_aa` | 8.45 | 11.15 | 0.30 | 19.90 | 50.2 | 55.27% | **0.9979** | **0.9567** |
+| **patch** | `pil` | 16.31 | 11.48 | 0.35 | 28.13 | 35.5 | 53.61% | — | — |
+| | `roi_align` | **7.76** | 11.10 | 0.32 | **19.17** | **52.2** | 55.68% | 0.9906 | 0.8970 |
+| | `interp_aa` | 8.59 | 11.07 | 0.31 | 19.96 | 50.1 | 53.01% | **0.9990** | **0.9636** |
+
+**pre 가 1.9~2.2배, 처리량이 1.41~1.47배** 빨라지고 zero-shot top-1 은 오차범위
+안이다(−0.67 ~ +2.26pp). 빈 마스크 fallback 판정 갈림은 **9칸 전부 0건**이다.
+
+**그래도 기본값은 `pil` 이다.** 임베딩 코사인이 0.998 대로 높지만 1.0 이 아니라,
+이미 저장된 임베딩과 새 임베딩을 섞어 거리 비교를 하면 같은 물체가 0.95 대로
+벌어진다 — 인스턴스 매칭과 재식별이 정확히 그것을 한다. 바꾸려면 **저장된 임베딩
+전체를 재생성해야 한다.**
+
+| 소비자 | 권장 |
+|---|---|
+| 임베딩 **거리**를 직접 쓴다 (매칭·재식별) | `interp_aa` — 꼬리가 0.96 대 0.86 으로 짧다 |
+| **라벨링만** 쓰고 N 이 크게 변한다 | `roi_align` — pre 가 N 에 거의 무관하다 (+35%) |
+| 기존 임베딩과 섞어야 한다 | `pil` |
+
+GPU 경로는 `--crop-policy bbox --crop-fit pad` 전용이고, 다른 조합을 주면 노드가
+뜨지 않는다. 자세한 근거·드리프트·버그 기록은 `docs/preprocess_paths.md`,
+최적화 전체 기록은 `docs/최적화.md` 에 있다.
 
 ---
 
@@ -864,146 +737,57 @@ ToTensor → Normalize                                   ← 배치 한 번에 d
 
 출력은 `segment_ids`/`boxes`/region 픽셀/mask 픽셀 모두 **비트 단위로 동일**하다.
 
-#### (3) 패치 점유율 직행 — 224 마스크를 아예 만들지 않는다
-
-마스크 경로는 **1024:1 낭비**였다. 224×224 = 50,176 픽셀을 만들어 GPU 에 올린 뒤
-7×7 = **49개** 숫자로 줄이고 있었다.
-
-NEAREST resize 는 보간이 아니라 **인덱스 gather** 라서 접을 수 있다. 출력 픽셀
-`(i, j)` 는 원본 `(idx[i], idx[j])` 를 그대로 집어 오고 점유율은 32×32 블록의
-평균이므로,
-
-```
-occupancy[p, q] = (1/1024) · Σ mask[idx[i], idx[j]]  =  (1/1024) · (Cy[p] · mask · Cx[q])
-```
-
-로 **계수행렬 두 개의 행렬곱**이 된다. `Cy[p, y]` 는 "패치 `p` 에 속한 출력 행 중
-원본 행 `y` 를 집는 개수"다. 합이 정수(≤1024)라 float32 반올림이 없어 기존 경로와
-**비트 단위로 같은 값**이 나온다 (`clip_backend.patch_occupancy_from_masks`).
-
-- `(length, offset, side)` 가 같으면 계수행렬도 같으므로 **중복 제거**하고 색인으로 참조
-- 남은 조합은 `bincount` 한 번으로 일괄 생성 — 조합마다 numpy 를 부르면 32장에 1.60ms
-  인데 일괄로는 0.30ms 다. 작은 배열에 numpy 를 수백 번 부르는 오버헤드가 계산보다 컸다
-- `crop_fit="pad"` 이고 마스크가 crop 크기 ndarray 로 들어올 때만 쓴다. 그 밖(다른
-  `crop_fit`, PIL 입력, 224 가 격자로 안 나누어떨어짐)은 기존 224 경로로 돈다
-
-**32개 기준 5.40ms → 1.67ms.** 이것 때문에 마스크 모드의 전처리가 `cls` 와 거의
-같아졌다.
-
-#### (4) ROS 메시지 고속 경로 — Postprocessing 7배
-
-`InstanceEmbeddingSet.embeddings` setter 에는 `array.array` 고속 경로가 있는데
-`.tolist()` 로 **Python 리스트**를 넘겨 느린 경로를 타고 있었다. 16,384개 원소를
-**네 번** 훑는다:
-
-```
-numpy → .tolist()                     16,384개 Python float 객체 생성
-      → all(isinstance(v, float) …)   16,384회 검사
-      → all(범위 검사 …)                16,384회 검사
-      → array.array('f', value)       다시 C 배열로
-```
-
-`array("f", arr.tobytes())` 로 넘기면 필드 타입과 정확히 같아 그 검사를 통째로
-건너뛴다. 바이트가 그대로 들어가므로 **값은 동일**하다.
-
-**1.327ms → 0.008ms (164배).** Postprocessing 전체가 1.6ms → 0.23ms 가 됐다.
-
-#### (5) pinned 스테이징 버퍼
-
-`np.stack` 이 만든 pageable 메모리에서 복사하면 드라이버가 내부 임시 pinned 버퍼를
-한 번 더 거친다. 미리 잡아 둔 pinned 버퍼에 직접 써 넣으면 그 왕복이 사라진다
-(32장 224×224×3: **1.28ms → 0.83ms**).
-
-버퍼를 재사용하므로 **다음 프레임이 덮어쓰기 전에 이전 H2D 가 끝나야 한다.** 복사
-직후 기록한 `torch.cuda.Event` 를 다음 호출 맨 앞에서 기다린다. 이게 없으면
-`non_blocking` 복사가 진행 중인 메모리를 CPU 가 갈아엎어 **조용히 값이 깨진다.**
-
-#### (6) 지연 futures + 루프 내 D2H 제거 — 성능 중립, 구조 개선
-
-프레임 안에서 전처리와 엔진을 겹치려고 두 가지를 바꿨다.
-
-- `prepare()` 가 224 기하를 `pool.map`(전부 끝날 때까지 블록) 대신 `pool.submit`
-  으로 던지고 **future 만 들고 반환**한다. `run()` 이 청크마다 필요한 만큼만 `result()`
-  한다
-- 엔진 루프에서 **`.cpu()` 를 전부 걷어냈다.** 청크마다 3회씩 하던 D2H(`empty`,
-  `occupancy`, `weights`)와 `np.where` fallback 을 device 텐서 누적으로 바꾸고,
-  **D2H 는 루프가 끝난 뒤 한 번만** 한다. `infer(..., as_tensor=True)` 추가
-
-**결과는 성능 중립이다** (18.20 → 18.20ms). 이유는 아래 "버린 것"에 적었다. 다만
-동기화 지점이 청크당 3개에서 프레임당 1개로 줄었고, 이건 프레임 **간** 파이프라이닝의
-전제 조건이라 남겨 두었다. `PreparedBatch` 가 프레임에 딸린 것만 담는 것도 같은 이유다.
-
-#### ⚠ `build_regions` 의 마스크 생략은 호출자가 정한다
-
-(3) 을 넣으면서 "cls 는 마스크를 안 쓰니 만들지 말자"를 `build_regions` 안에서
-`self.pooling_mode` 로 판단하게 했더니 **`tools/` 의 벤치마크가 조용히 망가졌다.**
-
-`tools/` 의 도구들은 **첫 모드의 노드로 crop 을 한 번 만들어 나머지 모드에 그대로
-넘긴다** — 세 모드가 같은 crop 을 공유해야 pooling 차이만 분리되기 때문이다. 첫
-모드가 `cls` 면 마스크가 전부 `None` 이 되고 뒤따르는 마스크 모드가 쓰레기를 받는다.
-
-| `--modes` 순서 | `value` | `patch` |
-|---|---|---|
-| `value` 먼저 | 87.92% ✓ | 7.87% ✓ |
-| **`cls` 먼저** | **76.08%** ✗ | **35.26%** ✗ |
-
-알파벳순으로 주면 항상 `cls` 가 먼저라 두 모드가 말없이 틀어진다.
-
-**고친 방식**: `build_regions(..., with_masks: bool = True)` 로 **기본값을 계약으로**
-두고, 노드의 프레임 경로만 `with_masks=self.needs_region_masks` 로 명시해 생략한다.
-생략 여부는 인스턴스 상태가 아니라 호출자가 정한다.
-
 #### 효과 — 같은 엔진으로 코드만 바꿔 A/B
 
 `src/meridian_clip_backup` 에 최적화 직전 코드가 남아 있어, **같은 엔진
 (min=1/opt=32/max=64) 과 같은 `batch_size=32`** 로 코드만 갈아끼워 쟀다. 즉 아래 차이는
 전부 코드에서 온 것이다. N=32, 40회 중앙값.
 
-재현: `python3 tools/benchmark_stages.py --variant both --segments 32`
+**`cls`**
 
-| | 단계 | 최적화 전 | **현재** | 배속 |
-|---|---|---|---|---|
-| **`cls`** | Preprocessing | 35.535 | **9.358** | **3.80x** |
-| | CLIP Encoder | 7.650 | 7.243 | 1.06x (동일) |
-| | Postprocessing | 1.612 | **0.230** | **7.01x** |
-| | **합계** | **44.796 ms** (22.3 FPS) | **16.832 ms** (59.4 FPS) | **2.66x** |
-| **`value`** | Preprocessing | 40.322 | **9.983** | **4.04x** |
-| | CLIP Encoder | 7.825 | 7.984 | 0.98x (동일) |
-| | Postprocessing | 1.617 | **0.232** | **6.95x** |
-| | **합계** | **49.764 ms** (20.1 FPS) | **18.200 ms** (54.9 FPS) | **2.73x** |
-| **`patch`** | Preprocessing | 40.440 | **9.579** | **4.22x** |
-| | CLIP Encoder | 7.364 | 8.092 | 0.91x (동일) |
-| | Postprocessing | 1.623 | **0.233** | **6.98x** |
-| | **합계** | **49.427 ms** (20.2 FPS) | **17.904 ms** (55.9 FPS) | **2.76x** |
+| 단계 | 최적화 전 | **현재** | 배속 |
+|---|---|---|---|
+| **Preprocessing** | 34.168 | **9.294** | **3.68x** |
+| CLIP Encoder | 7.517 | 7.835 | 0.96x (동일) |
+| Postprocessing | 1.597 | 1.530 | 1.04x |
+| **합계** | **43.282 ms** (23.1 FPS) | **18.659 ms** (53.6 FPS) | **2.32x** |
 
-엔진은 손대지 않았으므로 그대로다(0.91~1.06x 는 클럭 변동). **전처리 3.8~4.2배와
-Postprocessing 7배가 전부**이고, 그 결과 Preprocessing 비중이 79% → 54% 로 내려가면서
-엔진이 최대 단일 항목이 됐다.
+**`mask_weighted_value`** (기본값)
 
-정확도는 그대로다.
+| 단계 | 최적화 전 | **현재** | 배속 |
+|---|---|---|---|
+| **Preprocessing** | 38.783 | **12.542** | **3.09x** |
+| CLIP Encoder | 7.739 | 8.363 | 0.93x (동일) |
+| Postprocessing | 1.589 | 1.558 | 1.02x |
+| **합계** | **48.111 ms** (20.8 FPS) | **22.464 ms** (44.5 FPS) | **2.14x** |
 
-**같은 엔진**으로 코드만 갈아끼워 잰 값이다 (top-1 micro / macro).
+**`mask_weighted_patch`**
 
-| pooling | 최적화 전 | 현재 |
-|---|---|---|
-| `cls` | 83.07% / 88.02% | 83.07% / **88.08%** |
-| `mask_weighted_patch` | 7.89% / 10.55% | 7.87% / 10.51% |
-| **`mask_weighted_value`** | **87.98%** / 90.14% | **87.92%** / 90.08% |
+| 단계 | 최적화 전 | **현재** | 배속 |
+|---|---|---|---|
+| **Preprocessing** | 40.021 | **12.394** | **3.23x** |
+| CLIP Encoder | 7.671 | 8.545 | 0.90x (동일) |
+| Postprocessing | 1.589 | 1.566 | 1.01x |
+| **합계** | **49.282 ms** (20.3 FPS) | **22.505 ms** (44.4 FPS) | **2.19x** |
 
-차이는 `value` 기준 **3,420개 중 2개**이고 `cls` macro 는 오히려 올랐다 -- 방향이
-섞여 있는 것이 반올림 노이즈의 특징이다.
+**Preprocessing 만 3.1~3.7배 줄었고 나머지 둘은 그대로다.** 엔진과 후처리는 손대지
+않았으므로 당연한 결과이고, 그쪽의 ±0.3~0.9ms 차이는 실행 간 변동이다. 그 결과
+Preprocessing 비중이 **79~81% → 50~56%** 로 내려가면서 엔진이 최대 단일 항목이 됐다.
 
-출처는 **전처리의 float32 반올림 하나뿐이다.** `ToTensor`+`Normalize`(CPU) 를
-uint8 H2D + GPU 정규화로 바꾸면서 입력에 4.8e-7 오차가 생기고, fp16 엔진을 지나며
-임베딩 코사인 0.999984 가 된다. 경계선에 있던 2개가 뒤집힌다. 점유율 직행 경로는
-정수합이라 비트 동일이라 기여가 없다.
+정확도는 그대로다 — `value` top-1 87.98% → 87.92% (엔진 재빌드분 포함, 3,420개 중 2개).
 
-> **엔진 재빌드는 정확도를 바꾸지 않았다.** 백업 코드로 재면 옛 엔진(max=32)과
-> 새 엔진(min=1/opt=32/max=64) 모두 `value` 87.98% 로 같다. 프로파일 변경은 커널
-> 선택만 바꾸고 수치는 건드리지 않는다.
+> **재현 방법.** `meridian_clip_backup` 은 코드만 남기고 `models/` 는 지웠다
+> (2.2GB 중복이었고, 백업 코드도 엔진 경로를 `~/meridian/src/meridian_clip/models/`
+> 절대경로로 갖고 있어 읽지 않는다). 그래서 `sys.path` 앞에 백업 경로를 넣어
+> import 하면 같은 엔진을 쓰면서 옛 코드로 돌릴 수 있다:
 >
-> 정확도 측정은 **완전히 결정적이다** -- 3회 반복이 소수점까지 일치한다. 속도와
-> 달리 실행 간 변동이 없으므로, 값이 달라졌다면 코드가 달라진 것이다.
+> ```python
+> import sys
+> sys.path.insert(0, "/home/sojin/meridian/src/meridian_clip_backup")
+> from meridian_clip.clip_inference_node import ClipInferenceNode  # 옛 코드
+> ```
+>
+> 이때 `batch_size=32` 를 명시해야 한다 — 백업의 기본값은 16이다.
 
 #### 측정해 보고 **버린** 것
 
@@ -1011,7 +795,7 @@ uint8 H2D + GPU 정규화로 바꾸면서 입력에 4.8e-7 오차가 생기고, 
 
 | 시도 | 결과 | 왜 안 됐나 |
 |---|---|---|
-| **프레임 내 CPU/GPU 파이프라이닝** | **1.00x** | 아래 참고 -- 겹칠 일감이 애초에 없다 |
+| **CPU/GPU 파이프라이닝** | **1.02~1.04x** (N=8 은 0.87x) | 배치 사이 메인 스레드 작업(`.cpu().numpy()` ×3, `np.where`, 버퍼 복사)이 GIL 을 쥐어 엔진 대기 창에 PIL 워커가 못 돈다. 격리 테스트에서는 2.14배가 나오지만 실제 루프에서는 사라진다 |
 | **마스크 → 7×7 BOX 직행** | 2.4% | 전송량은 1024:1 로 주는데 병목이 224 해상도가 아니라 마스크당 PIL 호출 오버헤드였다. NEAREST 양자화가 빠져 점유율도 달라진다(비트 비동일) |
 | **마스크 기하를 numpy gather 로** | **6배 느림** | PIL 의 NEAREST 인덱스를 실측으로 재현해 비트 일치까지 확인했으나, PIL 의 C resize 가 numpy fancy indexing 보다 훨씬 빠르다 |
 | **CUDA graph** (GPU tail) | **0.95x (역효과)** | replay 가 입력을 static 버퍼로 `copy_` 해야 하는데 그 비용이 커널 4개보다 크다. 대역폭 바운드라 런치 오버헤드가 지배적이지 않다 |
@@ -1020,33 +804,6 @@ uint8 H2D + GPU 정규화로 바꾸면서 입력에 4.8e-7 오차가 생기고, 
 | **`reducing_gap=2/3`** | 0.93x (역효과) | 큰 축소비에서만 이득인데 세그먼트 crop 은 확대되는 경우가 많다 |
 | **pinned buffer + non_blocking** | ~1.00x | `np.stack` + H2D 가 이미 전처리의 8.8% 뿐 |
 | **스레드 12/16/24개** | ~1.02x | 8개에서 이미 평평하다 |
-
-**프레임 안에서는 겹칠 것이 없다 (실측).** (6) 을 넣고 청크별 대기 시간을 재 보면:
-
-```
-prepare(제출 + 점유율)   5.18 ms
-청크   future 대기   업로드+정규화    엔진
-  0        0.02          0.91      4.21
-  1        0.01          0.47      5.63
-```
-
-`future 대기 = 0.02ms` -- 엔진이 시작될 때 PIL 은 **이미 끝나 있다.** `prepare()` 가
-futures 를 던진 뒤 점유율(numpy, 메인 스레드)을 계산하는데, 그 사이에 워커 8개가
-32장을 다 만들어 버린다. 즉 **중첩은 이미 일어나고 있고**, 상대가 엔진이 아니라
-점유율 계산일 뿐이다.
-
-청크를 쪼개도 소용없다. 겹칠 일감이 없는데 엔진만 비효율적이 된다.
-
-| `batch_size` | 청크 수 | Preprocessing | Encoder | 합계 |
-|---|---|---|---|---|
-| 8 | 4 | 9.914 | 9.476 | 19.617 |
-| 16 | 2 | 9.721 | 8.599 | 18.541 |
-| **32** | **1** | 10.043 | **7.932** | **18.196** |
-
-**남은 것은 프레임 *간* 파이프라이닝이다.** 프레임 k 의 엔진이 도는 동안 프레임 k+1 의
-전처리를 시작하는 구조로, `prepare` 스레드와 `run` 스레드를 나누고 `PreparedBatch` 를
-큐로 넘기면 된다. 기대치는 프레임당 `max(전처리 8.5, 엔진 7.9)` ≈ 10ms (**1.8배**)이고
-처리량만 오른다(단일 프레임 지연은 그대로). 노드 구조 변경이라 아직 하지 않았다.
 
 **vectorization** 은 두 갈래로 결론이 나 있다. GPU tail 은 이미 배치 연산이고, PIL 루프는
 **crop 마다 크기가 달라 벡터화 자체가 불가능**하다.
@@ -1067,23 +824,14 @@ torch 의 bicubic 은 커널 상수가 PIL 과 달라(a=−0.75 vs −0.5) `anti
 
 | | ms | 비중 |
 |---|---|---|
-| **TensorRT 엔진** | 7.98 | **43.9%** |
-| Preprocessing (224 RGB + 분해/crop) | 9.98 | 54.9% |
-| Postprocessing | 0.23 | 1.3% |
+| **TensorRT 엔진** | 8.35 | **37.1%** |
+| 224 전처리 — RGB | 6.88 | 30.5% |
+| 224 전처리 — 마스크 | 2.91 | 12.9% |
+| 세그먼트 분해 + bbox crop | 2.37 | 10.5% |
+| 나머지 5개 단계 | 2.03 | 9.0% |
 
-Preprocessing 안에서는 **224 RGB 리사이즈가 여전히 대부분**이고 그 다음이
-`build_regions` 다. 마스크 경로는 (3) 으로 거의 사라졌고 Postprocessing 은 (4) 로
-1.3% 까지 내려가 더 볼 것이 없다.
-
-엔진이 사실상 최대 단일 항목이다. `opt` 를 32로 올려 한 번 더 얻었고(위 표),
-`builder_optimization_level=5` 는 245초 빌드해서 **0.2%** 뿐이라 폐기했다. 남은 여지는
+엔진이 최대 항목이다. `opt` 를 32로 올려 한 번 더 얻었으므로(위 표) 남은 여지는
 **INT8 양자화나 더 작은 백본**이다. 전처리는 위의 "수치를 바꾸는" 후보들뿐이다.
-
-> **엔진 시간은 GPU 클럭에 크게 좌우된다.** 프레임의 44%만 GPU 가 일하므로 드라이버가
-> 저부하로 판단해 클럭을 내린다. 부스트 상태(1965MHz)에서 재면 배치 32가 **5.76ms**
-> (이미지당 0.180ms, fp16 피크의 91%) 로 여기가 천장이다. 머신 간 비교나 회귀 측정을
-> 할 거면 `sudo nvidia-smi -pm 1 && sudo nvidia-smi -lgc 1900` 으로 **양쪽 다 고정**해야
-> 한다. 고정하지 않으면 같은 코드가 ±40% 흔들린다.
 
 세그먼테이션 쪽에서 **N 자체를 줄이는 것**이 가장 값싼 지렛대다 (`sam_node` 의
 `area_min` 상향, `--min-segment-pixels`) — 모든 단계가 N 에 선형이라 그대로 비례해서
@@ -1108,19 +856,6 @@ python meridian_clip/build_engine.py --part text --max-batch 128 --opt-batch 32
 
 `--part` 는 `visual`(cls) / `visual_pooled`(patch) / `visual_pooled_value`(value) / `text`.
 쓸 pooling mode 것만 있으면 된다.
-
-빌드 품질 손잡이는 두 개다. 둘 다 `trtexec` 의 같은 이름 옵션과 대응한다.
-
-| 인자 | 기본값 | 뜻 (`trtexec`) |
-|---|---|---|
-| `--avg-timing` | 8 | tactic 하나를 몇 번 재서 평균낼지 (`--avgTiming`) |
-| `--optimization-level` | 3 | tactic 탐색 범위 0~5, 5가 가장 넓다 (`--builderOptimizationLevel`) |
-
-올리면 빌드가 느려지는 대신 tactic 선택이 노이즈에 덜 흔들린다. 장비를 바꿔
-성능을 다시 잴 때는 두 값을 맞춰 두어야 비교가 성립한다.
-
-fp16 은 커널 **내부**만이다. 네트워크 입출력은 ONNX 그대로 fp32 로 두므로
-(`DIRECT_IO` / fp16 IO format 을 켜지 않는다) 노드 쪽 버퍼 dtype 은 바뀌지 않는다.
 
 | 파일 | 용도 |
 |---|---|
@@ -1148,47 +883,36 @@ fp16 은 커널 **내부**만이다. 네트워크 입출력은 ONNX 그대로 fp
 
 ## 8. 빌드와 실행 환경
 
-**빌드와 실행의 파이썬이 다르다.** 빌드는 시스템 파이썬(colcon)이 하고, 실행은
-torch/cuda/tensorrt/clip 이 있는 conda `clip` 환경이 한다.
+**빌드와 실행의 파이썬이 다르다.**
 
-이어 주는 것이 콘솔 스크립트의 shebang 이고, `setup.cfg` 가 그것을 정한다.
-
-```ini
-[build_scripts]
-executable=/usr/bin/env python3
-```
-
-> **clone 후 고칠 것이 없다.** 대신 **실행 전에 conda 환경을 활성화해야 한다.**
-> `/usr/bin/env` 가 PATH 에서 `python3` 를 찾으므로, 활성화된 환경이 곧 노드가
-> 도는 환경이다.
+> **clone 했다면 `setup.cfg` 의 `[build_scripts] executable` 을 먼저 고친다.**
+> 저장소에는 작성자 머신의 절대경로가 박혀 있다.
 >
-> 이 줄이 아예 없으면 colcon 은 **자신을 띄운 파이썬**(`/usr/bin/python3`)을
-> shebang 에 박고 `ros2 launch` 가 `ModuleNotFoundError` 로 죽는다. colcon 이
-> `sys.executable` 로 `setup.py` 를 돌리는데 `/usr/bin/colcon` 의 shebang 이
-> 시스템 파이썬이라, **conda 를 켜 두고 빌드해도 결과가 같다.**
+> ```bash
+> sed -i "s|^executable=.*|executable=$HOME/miniconda3/envs/clip/bin/python|" \
+>     ~/meridian/src/meridian_clip/setup.cfg
+> ```
 >
-> 절대경로(`/home/<user>/miniconda3/...`)를 박으면 활성화 없이도 돌지만 파일이
-> 머신마다 달라진다. 상대경로는 **쓸 수 없다** -- shebang 의 상대경로는 스크립트
-> 위치가 아니라 실행하는 프로세스의 cwd 기준으로 풀려서 홈에서 띄울 때만
-> 동작한다. 커널은 `~` 도 확장하지 않는다 (`#!~/miniconda3/...` 는 항상
-> `bad interpreter` 다).
+> conda 를 다른 곳에 깔았거나 환경 이름이 `clip` 이 아니면 그 경로로 바꾼다
+> (`conda run -n <env> python -c 'import sys; print(sys.executable)'` 로 확인).
+>
+> 이 줄이 없으면 colcon 은 **자신을 띄운 파이썬**(`/usr/bin/python3`)을 콘솔 스크립트
+> shebang 에 박고, `ros2 launch` 가 `ModuleNotFoundError: No module named 'clip'` 로
+> 죽는다. 실행 환경을 shebang 에 고정하는 것이 목적이라 절대경로여야 하고,
+> 그래서 머신마다 다르다. 래퍼 `.sh` 를 두지 않는 이유이기도 하다.
 
 ```bash
-# 빌드 — 평범하게. conda 활성화 여부는 결과에 영향이 없다
+# 빌드 — conda 를 끄고
+eval "$(conda shell.bash hook)" && conda deactivate && conda deactivate
 cd ~/meridian && source /opt/ros/humble/setup.bash
-colcon build --packages-select meridian_msgs meridian_clip
+colcon build --packages-select meridian_clip
 
-# 실행 — conda 환경을 켜고
-conda activate clip
-source ~/meridian/install/setup.bash
-ros2 launch meridian_clip clip_inference.launch.py
+# 재빌드 후 매번 — shebang 을 conda clip 으로 되돌린다
+sed -i "1s|.*|#!$HOME/miniconda3/envs/clip/bin/python|" \
+    ~/meridian/install/meridian_clip/lib/meridian_clip/clip_inference_node
 ```
 
-활성화를 잊으면 base 파이썬을 잡아 `ModuleNotFoundError` 로 죽는다. 조용히 잘못된
-파이썬으로 도는 경우는 없으므로 증상이 바로 드러난다.
-
-> 환경 이름이 `clip` 이 아니면 그 이름으로 활성화하면 된다. `setup.cfg` 는
-> 건드릴 필요가 없다.
+실행은 conda `clip` 환경 (torch/cuda/tensorrt/clip 이 거기 있다).
 
 > **scipy 가 필요하다.** `build_regions` 가 `scipy.ndimage.find_objects` 로 모든 라벨의
 > bbox 를 한 번에 얻는다 (§6). `package.xml` 에 `python3-scipy` 로 선언돼 있고 conda
@@ -1202,7 +926,6 @@ ros2 launch meridian_clip clip_inference.launch.py
 
 | 도구 | 용도 |
 |---|---|
-| **`benchmark_stages.py`** | **Preprocessing / CLIP Encoder / Postprocessing 단계별 실행 시간. 데이터셋·카메라·FastSAM 불필요** (합성 프레임). `--variant both` 로 최적화 전후 A/B (§6) |
 | `compare_pooling.py` | 사진 한 장으로 pooling 3종을 나란히 비교. crop/mask 를 한 번만 만들어 공유하므로 **pooling 만** 달라진다 |
 | `benchmark_pooling.py` | VOC2012 로 pooling 별 zero-shot top-1 (§3 첫 표) |
 | `benchmark_language.py` | VOC2012 로 **언어 쪽** — text→image 검색과 프롬프트 표현 강건성 ([언어 쪽 성능](#언어-쪽-성능)) |
@@ -1210,11 +933,6 @@ ros2 launch meridian_clip clip_inference.launch.py
 | `clip_selftest.py` | ROS 토픽 없이 노드를 직접 만들어 같은 코드 경로를 태움. `--check-parity` |
 | `check_embedding_layout.py` | 메시지 평탄화 레이아웃 검증 |
 | `single_image_test.py` | **현재 실행 불가** — 삭제된 `fastsam_ros.fastsam_segmenter` 를 import 한다 |
-
-> **이 도구들은 첫 모드의 노드로 crop/mask 를 한 번 만들어 나머지 모드에 그대로
-> 넘긴다.** 세 모드가 같은 crop 을 공유해야 pooling 차이만 분리되기 때문이다. 그래서
-> `build_regions` 는 `pooling_mode` 를 보고 마스크를 생략하면 안 된다 — 생략 여부는
-> `with_masks` 인자로 **호출자가 정한다** (§6 의 ⚠ 절).
 
 ```bash
 python tools/compare_pooling.py --image ~/pencil.png --truth "a pencil" --crop-fit pad

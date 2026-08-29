@@ -570,6 +570,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="세그먼트마다 발행할 상위 후보 수",
     )
     parser.add_argument(
+        "--min-segment-area",
+        type=int,
+        default=0,
+        help=(
+            "이 픽셀 수(라벨 이미지 = RGB 해상도 기준) 미만인 세그먼트는 "
+            "인코딩하지 않는다. 0이면 끔. enc 시간이 세그먼트 수 N 에 거의 "
+            "정비례하므로(실측 enc ~ 1.0ms x N) 잔챙이를 거르면 그만큼 준다. "
+            "SAM 의 --area-min 과 달리 /segment_image 는 건드리지 않아서 "
+            "geobuilder 는 작은 물체까지 그대로 3D 로 복원한다"
+        ),
+    )
+    parser.add_argument(
+        "--max-segments",
+        type=int,
+        default=0,
+        help=(
+            "면적 큰 것부터 이 개수까지만 인코딩한다. 0이면 끔. enc 시간에 "
+            "상한을 걸어 장면이 복잡해져도 프레임 시간이 튀지 않게 한다"
+        ),
+    )
+    parser.add_argument(
         "--min-score",
         type=float,
         default=DEFAULT_MIN_SCORE,
@@ -673,7 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "49개 patch token 을 합치는 방법. "
             "mask_weighted_value=마지막 블록의 value 투영을 마스크 점유율로 "
-            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%%), "
+            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%), "
             "mask_weighted_patch=최종 patch token 으로 같은 가중평균 "
             "(텍스트 정렬이 깨져 AUC 0.4633, --alignment-matrix 없이는 "
             "zero-shot 라벨링이 동작하지 않는다), "
@@ -917,6 +938,8 @@ class ClipInferenceNode(Node):
         publish_semantics: bool = DEFAULT_PUBLISH_SEMANTICS,
         prompts: Optional[List[str]] = None,
         top_k: int = DEFAULT_TOP_K,
+        min_segment_area: int = 0,
+        max_segments: int = 0,
         min_score: float = DEFAULT_MIN_SCORE,
         log_every: int = DEFAULT_LOG_EVERY,
         log_values: int = DEFAULT_LOG_VALUES,
@@ -976,6 +999,9 @@ class ClipInferenceNode(Node):
         self.publish_semantics = publish_semantics
         self.prompts = list(prompts) if prompts else list(DEFAULT_PROMPTS)
         self.top_k = int(top_k)
+        # select_segments() 가 쓰는 필터. 둘 다 0이면 기존 동작(전부 인코딩).
+        self.min_segment_area = max(0, int(min_segment_area))
+        self.max_segments = max(0, int(max_segments))
         self.min_score = float(min_score)
 
         self.log_every = int(log_every)
@@ -984,6 +1010,8 @@ class ClipInferenceNode(Node):
 
         # 프레임 로그용 카운터. build_regions가 필터링 통계를 여기에 남긴다.
         self.frame_count = 0
+        # 라벨 확대 로그를 한 번만 찍기 위한 플래그 (match_labels_to_image)
+        self.logged_label_resize = False
         self.last_candidate_count = 0
         self.last_skipped_count = 0
 
@@ -1727,6 +1755,54 @@ class ClipInferenceNode(Node):
     # Stage 1 : CPU 전처리
     # ----------------------------------------------------------------
 
+    def match_labels_to_image(
+        self,
+        labels: np.ndarray,
+        target_shape,
+    ) -> Optional[np.ndarray]:
+        """라벨 맵을 RGB 해상도로 최근접 확대한다.
+
+        segmentor 는 마스크를 proto 격자로 낸다 -- FastSAM 계열은 letterbox
+        패딩을 떼고 나면 640x480 입력에 대해 256x192 다. 이 노드의 나머지 경로는
+        (bbox 계산, 패치 점유율, crop) 전부 라벨과 RGB 가 같은 격자라고 전제하고
+        있어서, 크기가 다르면 예전에는 프레임을 통째로 버렸다. 그러면 파이프라인
+        중간에 확대 전용 노드를 하나 더 두게 되는데, 그건 300KB 이미지를 매
+        프레임 DDS 로 한 번 더 왕복시키는 값이다 (실측 코어 11%). 여기서 하면
+        cv2.resize 한 번(0.29ms)으로 끝난다.
+
+        **최근접이어야 한다.** 픽셀 값이 밝기가 아니라 segment_id 라서 보간하면
+        원래 없던 id 가 경계에 생긴다.
+
+        확대만 한다. 라벨에 letterbox 패딩이 남아 있으면 종횡비가 어긋나는데,
+        그건 조용히 늘려서 될 일이 아니라 에러로 알린다.
+        """
+        target_h, target_w = target_shape
+        source_h, source_w = labels.shape[:2]
+        scale_y = target_h / source_h
+        scale_x = target_w / source_w
+
+        # 1% 문턱. FastSAM 은 letterbox 를 정수 proto 행으로 반올림하므로 16:9
+        # 에서 배율이 0.07% 정도 어긋난다 -- 그건 정상이다. 패딩이 남은 경우는
+        # 몇 십 % 씩 벌어지므로 이 문턱으로 갈린다.
+        if abs(scale_y - scale_x) > 0.01 * max(scale_y, scale_x):
+            self.get_logger().error(
+                "RGB and segment label aspect ratio mismatch: "
+                f"rgb={target_shape}, labels={labels.shape[:2]} "
+                f"(scale y={scale_y:.4f} x={scale_x:.4f}). "
+                "라벨에 letterbox 패딩이 남아 있으면 이렇게 된다.",
+                throttle_duration_sec=5.0,
+            )
+            return None
+
+        if not self.logged_label_resize:
+            self.logged_label_resize = True
+            self.get_logger().info(
+                f"Segment labels {source_w}x{source_h} -> "
+                f"{target_w}x{target_h} (nearest, scale {scale_x:.4f})"
+            )
+        return cv2.resize(
+            labels, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
     def preprocess_frame(
         self,
         color_msg: RosImage,
@@ -1743,12 +1819,9 @@ class ClipInferenceNode(Node):
         labels = self.image_from_message(segment_msg, "mono8", 1)
 
         if rgb_image.shape[:2] != labels.shape[:2]:
-            self.get_logger().error(
-                "RGB and segment label image resolution mismatch: "
-                f"rgb={rgb_image.shape[:2]}, "
-                f"labels={labels.shape[:2]}"
-            )
-            return None
+            labels = self.match_labels_to_image(labels, rgb_image.shape[:2])
+            if labels is None:
+                return None
 
         if self.preprocess_path == "pil":
             segment_ids, regions, masks, boxes = self.build_regions(
@@ -2053,6 +2126,45 @@ class ClipInferenceNode(Node):
             min(int(bounds[3]) + self.bbox_padding, height),
         )
 
+    def select_segments(self, areas: np.ndarray) -> np.ndarray:
+        """인코딩할 segment_id 를 고른다 (면적 순 내림차순).
+
+        CLIP 은 프레임의 모든 세그먼트를 인코딩한다. 그런데 인코더 시간이
+        세그먼트 수 N 에 거의 정비례한다 -- 이 플랫폼 실측으로 전체 스택에서
+        ``enc ≈ 1.0 ms × N`` 이다 (N 7 -> 10 ms, 22 -> 21 ms, 42 -> 41 ms).
+        그래서 잔챙이 마스크 몇 개가 프레임 시간을 그대로 밀어 올린다.
+
+        SAM 쪽 ``area_min`` 을 올려도 N 은 줄지만, 그건 ``/segment_image`` 자체에서
+        마스크를 빼기 때문에 **geobuilder 도 같이 잃는다.** geobuilder 는 N 에
+        훨씬 둔감하므로(CPU 만 쓴다) 작은 물체까지 3D 로 복원하는 편이 낫다.
+        그래서 필터를 여기, 비싼 소비자 쪽에만 둔다.
+
+            min_segment_area   이 픽셀 수 미만인 세그먼트는 인코딩하지 않는다.
+                               라벨 이미지 좌표 기준이다(= RGB 해상도).
+            max_segments       면적 큰 것부터 이 개수까지만. enc 시간에 상한을
+                               걸어 장면이 복잡해져도 프레임 시간이 안 튄다.
+
+        둘 다 0 이면 아무것도 거르지 않는다(기존 동작). 빠진 세그먼트는
+        InstanceEmbeddingSet.segment_ids 에 안 들어갈 뿐이라, id 로 짝짓는
+        소비자에게는 그냥 "이번 프레임에 임베딩이 없는 인스턴스" 다.
+        """
+        present = np.nonzero(areas)[0]
+        present = present[present != BACKGROUND_SEGMENT_ID]
+        if not present.size:
+            return present
+
+        if self.min_segment_area > 0:
+            present = present[areas[present] >= self.min_segment_area]
+            if not present.size:
+                return present
+
+        if 0 < self.max_segments < present.size:
+            # 면적 큰 것부터 max_segments 개. 남긴 뒤 id 순으로 되돌린다 --
+            # 아래 로직이 present 가 오름차순인 것을 전제한다.
+            keep = present[np.argsort(-areas[present], kind="stable")]
+            present = np.sort(keep[: self.max_segments])
+        return present
+
     def scan_segments(
         self,
         labels: np.ndarray,
@@ -2086,8 +2198,7 @@ class ClipInferenceNode(Node):
             [MAX_SEGMENT_ID + 1], [0, MAX_SEGMENT_ID + 1],
         ).ravel()
 
-        present = np.nonzero(areas)[0]
-        present = present[present != BACKGROUND_SEGMENT_ID]
+        present = self.select_segments(areas)
 
         self.last_candidate_count = int(present.size)
         self.last_skipped_count = 0
@@ -2716,6 +2827,8 @@ def main(args=None) -> None:
         publish_semantics=cli.publish_semantics,
         prompts=prompts,
         top_k=cli.top_k,
+        min_segment_area=cli.min_segment_area,
+        max_segments=cli.max_segments,
         min_score=cli.min_score,
         log_every=cli.log_every,
         log_values=cli.log_values,

@@ -136,7 +136,7 @@ class EmbeddingMonitor(Node):
         if semantics is None:
             print(
                 "  semantics 없음 "
-                "(노드를 --no-publish-semantics 로 띄웠는지 확인)",
+                "(노드를 --publish-semantics false 로 띄웠는지 확인)",
                 flush=True,
             )
             return

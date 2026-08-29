@@ -255,24 +255,37 @@ DEFAULT_CROP_FIT = "pad"
 # 점유율까지 roi_align 으로 근사하면 얇은 세그먼트에서 빈 마스크 fallback 이
 # 뒤집혀 임베딩이 종류째로 달라진다 -- occupancy_from_frame 주석 참고.
 #
-# 실측 (Jetson Orin, mask_weighted_value, uHumans2 N 평균 18.6):
-#                     pre     enc    post   합계    FPS
-#   pil (배포)       16.70   12.09   0.36   29.15   34.3
-#   roi_align         8.56   11.84   0.34   20.74   48.2
-#   interp_aa         9.21   11.86   0.33   21.40   46.7
-# enc/post 는 경로와 무관하다 (같은 엔진, 같은 발행).
+# 실측 (Jetson AGX Orin, uHumans2 office, stride 10 -> 831프레임 /
+# 15,544 인스턴스, N 평균 18.7, 720x480, batch 32, 점유율 exact, 평균 ms.
+# 2026-08-24 측정 -- docs/preprocess_paths.md 2.1 / 2.5 와 같은 실행이다):
 #
-# pre 의 N 의존성이 갈린다 (N 6 -> 48):
-#   pil        12.75 -> 28.98   (+127%)
-#   roi_align   7.00 -> 10.66   (+52%)   배치 커널이라 N 을 흡수한다
-#   interp_aa   6.52 -> 13.31   (+104%)  인스턴스별 커널 런치 0.17ms/개
+#   모드    경로          pre     enc    post   합계    FPS
+#   cls     pil         14.30   10.46   0.34   25.11   39.8
+#           roi_align    6.56   10.26   0.29   17.11   58.4
+#           interp_aa    7.26   10.21   0.28   17.75   56.3
+#   value   pil         16.15   11.55   0.34   28.05   35.7
+#           roi_align    7.68   11.18   0.31   19.17   52.2
+#           interp_aa    8.45   11.15   0.30   19.90   50.2
+#   patch   pil         16.31   11.48   0.35   28.13   35.5
+#           roi_align    7.76   11.10   0.32   19.17   52.2
+#           interp_aa    8.59   11.07   0.31   19.96   50.1
+#
+# enc/post 는 경로와 사실상 무관하다 (같은 엔진, 같은 발행). pil 의 enc 가
+# 0.3ms 높은 것은 PIL 워커 8개가 CPU 를 채운 직후에 엔진을 부르기 때문이다.
+#
+# **N 을 맞추지 않은 표끼리 비교하면 안 된다.** enc 는 N 에 3.4배 반응한다.
+#
+# pre 의 N 의존성이 갈린다 (value, N 5-8 -> 33-64):
+#   pil        12.87 -> 24.59   (+91%)
+#   roi_align   6.83 ->  9.21   (+35%)   배치 커널이라 N 을 흡수한다
+#   interp_aa   6.36 -> 11.92   (+87%)   인스턴스별 커널 런치 0.17ms/개
 # 교차점이 N 약 8~9 다. N 이 작은 장면에서는 interp_aa 가 더 빠르다.
 #
-# 임베딩 드리프트 (pil 대비 코사인):
-#                    합성 노이즈        VOC2012 val         uHumans2 office
-#   interp_aa      1.0000 / 0.9999   0.9995 / 0.9736    0.9979 / 0.9535
-#   roi_align      0.9736 / 0.9425   0.9925 / 0.8768    0.9824 / 0.8490
-#                  (평균 / 최소)
+# 임베딩 드리프트 (pil 대비 코사인, 평균 / 최소):
+#                    합성 노이즈        VOC2012 val         uHumans2 (value)
+#   interp_aa      1.0000 / 0.9999   0.9995 / 0.9736    0.9979 / 0.9567
+#   roi_align      0.9736 / 0.9425   0.9925 / 0.8768    0.9848 / 0.8628
+# 빈 마스크 fallback 판정 갈림은 3 모드 x 2 경로 전부 0건이다.
 # zero-shot top-1 은 VOC 에서 pil 92.65% 대비 interp_aa 92.55% (-0.10pp),
 # roi_align 92.48% (-0.17pp) 로 셋이 오차범위 안이다. 갈리는 것은 거리다.
 #
@@ -685,6 +698,7 @@ class BatchPreprocessor:
         #   ((x/255) - mean) / std  ==  x * (1/(255*std)) - mean/std
         self.norm_scale = 1.0 / (255.0 * self.std)
         self.norm_shift = self.mean / self.std
+
 
     def image_array(self, image: PILImage.Image) -> np.ndarray:
         """PIL 기하만 적용해 [H, W, 3] uint8 로 돌려준다."""
