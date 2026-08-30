@@ -10,7 +10,7 @@
 
 실행 (torch/clip 불필요):
     source /opt/ros/humble/setup.bash
-    source ~/meridian/install/setup.bash
+    source <워크스페이스>/install/setup.bash
     ros2 run meridian_clip embedding_monitor
 """
 

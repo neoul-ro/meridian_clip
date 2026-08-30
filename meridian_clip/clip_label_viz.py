@@ -14,7 +14,7 @@
 
 실행 (ROS 만 있으면 되고 torch/clip 은 필요 없다):
     source /opt/ros/humble/setup.bash
-    source ~/meridian/install/setup.bash
+    source <워크스페이스>/install/setup.bash
     ros2 run meridian_clip clip_label_viz
 
 보기:

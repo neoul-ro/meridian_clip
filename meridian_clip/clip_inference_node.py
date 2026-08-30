@@ -87,6 +87,11 @@ from meridian_clip.clip_backend import (
     limit_blas_threads,
     prepare_from_frame,
 )
+from meridian_clip.model_paths import (
+    MODEL_DIR_ENV_VAR,
+    default_model_dir,
+    describe_candidates,
+)
 
 
 # CPU 전처리(1단계)와 GPU 추론(2단계)을 다른 스레드에서 겹쳐 돌린다.
@@ -193,6 +198,14 @@ BACKENDS = (
 # 그때는 --backend torch 로 돌리거나 build_engine.py 로 엔진을 다시 빌드한다.
 DEFAULT_BACKEND = "tensorrt"
 
+# 모델 바이너리(.pt/.onnx/.engine)가 있는 디렉터리.
+#
+# 절대경로를 소스에 박지 않는다 -- 머신마다 워크스페이스 이름도 사용자 이름도
+# 다르다. 찾는 규칙은 model_paths.py 에 한 벌만 두고 launch 와 공유한다
+# (환경변수 -> install share -> 소스 트리 순). meridian_seg 의
+# engine_candidates() 와 같은 규약이다.
+PACKAGE_MODEL_DIR = default_model_dir()
+
 # 플랫폼마다 모델 파일의 디렉터리만 다르게 줄 수 있다. 빈 문자열이면 아래
 # 개별 경로 기본값을 그대로 쓴다. --model-dir 를 주면 engine/checkpoint와
 # 자동 선택되는 text alignment matrix의 디렉터리를 이 값으로 통일한다.
@@ -202,18 +215,16 @@ DEFAULT_MODEL_DIR = ""
 DEFAULT_PREPROCESS_WORKERS = PREPROCESS_WORKERS
 DEFAULT_ASYNC_PREPROCESS_ENABLED = DEFAULT_ASYNC_PREPROCESS
 
-DEFAULT_ENGINE_PATH = (
-    "~/meridian/src/meridian_clip/models/"
-    "clip_vit_b32_visual_fp16.engine"
+DEFAULT_ENGINE_PATH = str(
+    Path(PACKAGE_MODEL_DIR) / "clip_vit_b32_visual_fp16.engine"
 )
 
 # mask_weighted_patch 용 엔진. weighted mean 과 ln_post/proj 까지 그래프에 들어
 # 있고 (images, patch_weights) -> (embeddings, cls_embeddings) 형태다.
 #   python3 meridian_clip/export_onnx.py  --part visual_pooled
 #   python3 meridian_clip/build_engine.py --part visual_pooled
-DEFAULT_POOLED_ENGINE_PATH = (
-    "~/meridian/src/meridian_clip/models/"
-    "clip_vit_b32_visual_pooled_fp16.engine"
+DEFAULT_POOLED_ENGINE_PATH = str(
+    Path(PACKAGE_MODEL_DIR) / "clip_vit_b32_visual_pooled_fp16.engine"
 )
 
 # mask_weighted_value 용 엔진. 입출력은 위와 똑같고 마지막 블록에서 value
@@ -221,9 +232,8 @@ DEFAULT_POOLED_ENGINE_PATH = (
 # 경로로 둔다.
 #   python3 meridian_clip/export_onnx.py  --part visual_pooled_value
 #   python3 meridian_clip/build_engine.py --part visual_pooled_value
-DEFAULT_VALUE_ENGINE_PATH = (
-    "~/meridian/src/meridian_clip/models/"
-    "clip_vit_b32_visual_pooled_value_fp16.engine"
+DEFAULT_VALUE_ENGINE_PATH = str(
+    Path(PACKAGE_MODEL_DIR) / "clip_vit_b32_visual_pooled_value_fp16.engine"
 )
 
 # 텍스트 인코더도 같은 방식으로 고를 수 있다.
@@ -231,16 +241,13 @@ DEFAULT_VALUE_ENGINE_PATH = (
 #   torch    : models/ViT-B-32.pt
 DEFAULT_TEXT_BACKEND = "tensorrt"
 
-DEFAULT_TEXT_ENGINE_PATH = (
-    "~/meridian/src/meridian_clip/models/"
-    "clip_vit_b32_text_fp16.engine"
+DEFAULT_TEXT_ENGINE_PATH = str(
+    Path(PACKAGE_MODEL_DIR) / "clip_vit_b32_text_fp16.engine"
 )
 
 # --backend torch 일 때 로드할 로컬 checkpoint(.pt) 경로.
 # models/ 는 install 트리에 복사하지 않으므로 소스 경로를 가리킨다.
-DEFAULT_MODEL_PATH = (
-    "~/meridian/src/meridian_clip/models/ViT-B-32.pt"
-)
+DEFAULT_MODEL_PATH = str(Path(PACKAGE_MODEL_DIR) / "ViT-B-32.pt")
 
 # 49개 patch token을 하나로 합치는 방법. 자세한 설명은 clip_backend.py 참고.
 #   cls                 : CLS token을 그대로 사용 (CLIP 원본 경로)
@@ -374,11 +381,11 @@ DEFAULT_TEXT_ALIGNMENT_MATRIX = ""
 # 자세한 내용은 README "행렬은 masked_bbox crop 으로 학습한다" 절.
 TEXT_ALIGNMENT_MATRICES = {
     "cls": "",
-    "mask_weighted_patch": (
-        "~/meridian/src/meridian_clip/models/align_patch_to_cls.npy"
+    "mask_weighted_patch": str(
+        Path(PACKAGE_MODEL_DIR) / "align_patch_to_cls.npy"
     ),
-    "mask_weighted_value": (
-        "~/meridian/src/meridian_clip/models/align_value_to_cls.npy"
+    "mask_weighted_value": str(
+        Path(PACKAGE_MODEL_DIR) / "align_value_to_cls.npy"
     ),
 }
 
@@ -694,7 +701,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "49개 patch token 을 합치는 방법. "
             "mask_weighted_value=마지막 블록의 value 투영을 마스크 점유율로 "
-            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%), "
+            "가중평균 (기본값. VOC2012 val 에서 AUC 0.9897 / top-1 87.98%%), "
             "mask_weighted_patch=최종 patch token 으로 같은 가중평균 "
             "(텍스트 정렬이 깨져 AUC 0.4633, --alignment-matrix 없이는 "
             "zero-shot 라벨링이 동작하지 않는다), "
@@ -1223,13 +1230,17 @@ class ClipInferenceNode(Node):
 
                 raise FileNotFoundError(
                     f"{self.pooling_mode} pooling 용 TensorRT 엔진이 없습니다: "
-                    f"{self.active_engine_path}\n"
-                    "다음으로 만들거나\n"
+                    f"{self.active_engine_path}\n\n"
+                    "모델 디렉터리로 찾아본 곳:\n  "
+                    + describe_candidates()
+                    + "\n\n다음으로 만들거나 (패키지 루트에서)\n"
                     "  python3 meridian_clip/export_onnx.py "
                     f"--part {part}\n"
                     "  python3 meridian_clip/build_engine.py "
-                    f"--part {part}\n"
-                    "--backend torch 로 실행하세요."
+                    f"--part {part}\n\n"
+                    f"이미 만들었다면 {MODEL_DIR_ENV_VAR} 환경변수나 "
+                    "--model-dir 로 그 위치를 알려주고,\n"
+                    "엔진을 못 만드는 환경이면 --backend torch 로 실행하세요."
                 )
 
         # ============================================================

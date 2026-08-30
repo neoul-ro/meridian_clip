@@ -1640,7 +1640,8 @@ class TorchBackend:
         )
 
         # clip.load 는 "~" 를 확장하지 않으므로 여기서 풀어준다.
-        # 기본 경로가 ~/meridian/... 형태라 이게 없으면 파일을 못 찾는다.
+        # --model-dir 나 MERIDIAN_CLIP_MODEL_DIR 로 "~/..." 를 받을 수 있고,
+        # 이게 없으면 그 형태에서 파일을 못 찾는다.
         self.model, _clip_preprocess = clip.load(
             str(Path(checkpoint).expanduser()),
             device=self.device,

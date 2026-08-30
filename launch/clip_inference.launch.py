@@ -18,31 +18,46 @@ QoS 는 BooleanOptionalAction 플래그라 launch 의 "--이름 값" 형식으�
 
 모델 경로
 --------
-엔진/체크포인트는 워크스페이스 밖(``~/meridian/models/clip/``)에 둔다 -- TensorRT
-엔진이 2.3GB 라 colcon install 트리로 복사시킬 값이 아니다. 개별 경로 다섯 개
-(model_path / engine_path / pooled_engine_path / value_engine_path /
-text_engine_path)는 ``model_dir`` 에서 조립하므로, 디렉터리를 옮겼으면 그 한
-줄만 바꾸면 된다:
+**절대경로를 이 파일에 박지 않는다.** 워크스페이스 이름도 사용자 이름도 머신마다
+다르다. 엔진/체크포인트는 ``<패키지 루트>/models/`` 에 두는 것이 기본이고 --
+download_weights.py / export_onnx.py / build_engine.py 세 스크립트의 기본 출력
+위치와 같다 -- 찾는 순서는 노드(``clip_inference_node.model_dir_candidates``)와
+글자 그대로 같다:
+
+    1. 환경변수 MERIDIAN_CLIP_MODEL_DIR
+    2. <share>/meridian_clip/models   (install 트리)
+    3. <패키지 루트>/models           (소스 트리)
+
+모델은 2GB 가 넘어서 install 트리로 복사시키지 않으므로, 평범한 colcon build
+에서는 2번이 비어 있고 3번도 소스가 아닌 install 을 가리킨다. 그때는 1번을 쓴다:
+
+    export MERIDIAN_CLIP_MODEL_DIR=<워크스페이스>/src/meridian/meridian_clip/models
+
+한 번만 다르게 띄우고 싶으면 launch 인자로도 된다:
 
     ros2 launch meridian_clip clip_inference.launch.py model_dir:=/opt/clip_models
 
-노드 쪽도 같은 규약이다 -- ``--model-dir`` 가 비어 있지 않으면 개별 경로의
-파일 이름만 남기고 디렉터리를 model_dir 로 갈아끼운다
+개별 경로 다섯 개(model_path / engine_path / pooled_engine_path /
+value_engine_path / text_engine_path)는 ``model_dir`` 에서 조립하므로 그 한
+줄만 바꾸면 전부 따라온다. 노드 쪽도 같은 규약이다 -- ``--model-dir`` 가 비어
+있지 않으면 개별 경로의 파일 이름만 남기고 디렉터리를 갈아끼운다
 (clip_inference_node.py 의 ``model_asset``).
 """
-
-import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 
+from meridian_clip.model_paths import default_model_dir
 
-# 모델 바이너리는 워크스페이스 밖에 둔다 (install 트리로 복사시키지 않는다).
-# 여기서 ~ 를 편다 -- 노드도 expanduser 하지만, launch 로그와 --show-args 에
-# 실제 경로가 찍히는 편이 경로 문제를 훨씬 빨리 잡는다.
-DEFAULT_MODEL_DIR = os.path.expanduser("~/meridian/models/clip")
+
+# 노드와 같은 함수를 부른다 -- 두 벌로 두면 조용히 어긋난다.
+# model_paths 는 표준 라이브러리 + ament_index 만 쓰므로, torch/tensorrt 가 없는
+# 시스템 파이썬으로 도는 ros2 launch 에서도 안전하게 import 된다.
+# 여기서 미리 풀어 두는 이유: launch 로그와 --show-args 에 실제 경로가 찍히는
+# 편이 경로 문제를 훨씬 빨리 잡는다.
+DEFAULT_MODEL_DIR = default_model_dir()
 
 
 def asset(filename):
